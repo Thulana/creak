@@ -41,6 +41,8 @@ Open that link from any device on your network. The token is stored in `/etc/cre
 
 One answer per sound is enough. A clip you confirm becomes an example; the next clip whose similarity to it is above `match_threshold` gets its label automatically. `ignore` works the same way, for sounds you never want to hear about again.
 
+Label the sound that triggered the clip, not what was playing in the background: a cough confirmed as "music" teaches creak that coughs are music. Clips in which the model hears nothing but silence or room tone are dropped without a trace, so there is no `silence` label.
+
 ## Configuration
 
 `/etc/creak/config.toml`. Every key is optional; these are the defaults:

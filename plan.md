@@ -1,10 +1,10 @@
 # creak — implementation plan
 
-_Written 2026-11-15. Status: Phase 0 (minimal deployable version) in progress._
+_Written 2026-11-15. Status: Phase 0 (minimal deployable version) in review; Phase 1 (accuracy) next._
 
 `creak` is a single-binary daemon that listens to one microphone all the time, cuts a clip whenever the sound rises above `n ×` the ambient level, lets a model tag the clip (door, doorbell, party, movie…), logs it, and publishes it to Home Assistant over MQTT. It then asks you whether the tag is right. One confirmation is enough: from then on, anything that sounds like that clip is tagged and published without asking.
 
-Linux comes first. macOS and Windows follow later (Phase 7), so platform-specific code stays in one module.
+Linux comes first. macOS and Windows follow later (Phase 6), so platform-specific code stays in one module.
 
 ## 1. Scope
 
@@ -66,11 +66,13 @@ The model always answers first; the user is only asked to check.
 
 1. Take the active part of the clip (from the trigger opening to its close, at least ~1 s, widened into the pre-roll if shorter). The pre-roll stays in the WAV for listening but is not embedded, so room ambient does not dominate the embedding.
 2. Run the model on it in 0.96 s patches with a 0.48 s hop. It returns AudioSet class scores and an embedding per patch; mean-pool both and L2-normalise the embedding.
-3. Find the nearest confirmed exemplar by cosine similarity (brute force is fine for thousands).
-4. Result:
+3. Take the model's view without the classes that are not a sound: Silence, the room and outdoor ambience classes, reverberation, echo and the noise classes. These are never proposed or shown. The best remaining class is the model's guess if it scores at least 0.1.
+4. Find the nearest confirmed exemplar by cosine similarity (brute force is fine for thousands).
+5. Result, in this order:
+   - **ignored**: the nearest exemplar is above `match_threshold` and carries the reserved label `ignore`. The event row is kept, the clip is not.
    - **match**: the nearest exemplar is above `match_threshold`. The clip takes that exemplar's label and is published at once. Nobody is asked.
-   - **pending**: nothing that close. The clip gets a proposed label and goes to the review queue as a question ("Door?"). The proposal is the nearest exemplar's label if it is above `suggest_threshold`, otherwise the model's top AudioSet class.
-   - **ignored**: the nearest match carries the reserved label `ignore`. The event row is kept, the clip is not.
+   - **dropped**: the model has no guess, so it heard nothing but silence or room tone. Nothing is stored: no row, no clip, no question. Silence is never an event and `silence` is not accepted as a label.
+   - **pending**: the clip gets a proposed label and goes to the review queue as a question ("Door?"). The proposal is the nearest exemplar's label if it is above `suggest_threshold`, otherwise the model's guess.
 
 On day one there are no exemplars, so every clip is pending with the model's own guess. Every event records its nearest exemplar and similarity, even below the thresholds, so the thresholds can be tuned from real data.
 
@@ -81,6 +83,7 @@ On day one there are no exemplars, so every clip is pending with the model's own
 - Reliability comes from `match_threshold`, not from repetition. A sound that differs from the exemplar (the same door closed gently) falls below it, is asked about once, and then matches as well.
 - A wrong match can be corrected afterwards in the event log. The clip becomes an exemplar for the right label, so the nearest exemplar is the right one next time.
 - Pending clips are not published unless `publish_pending = true`.
+- **Label the sound that triggered the clip, not what was on in the background.** Background music belongs to scenes (§3.4). A cough confirmed as "music" because music was playing becomes a music exemplar, and the next cough is tagged "music" without a question. Phase 0 data had this for 9 of 16 music exemplars; §3.8 is about catching and preventing it.
 
 ### 3.4 Scenes (party, movie, music)
 
@@ -125,6 +128,32 @@ Turned on or off with `[web] enabled`. With it off, the daemon, the CLI and MQTT
 - One static HTML file with plain JavaScript, embedded in the binary. No build step, no framework.
 - It talks to a small JSON API on the same port; clips are served as WAV with range requests, so every browser's own audio player works.
 - The built-in default binds to `127.0.0.1`. `creak setup` writes a config that binds to all interfaces with a random token, because the usual install is a headless box reviewed from another device. Keep it on a trusted network or a VPN; never expose it to the internet.
+
+### 3.8 Measuring and protecting accuracy
+
+One confirmation is enough only if confirmations are right. Phase 0 showed they often are not: proposals anchor the answer, and clips that mix a foreground and a background sound get the background's label. So accuracy is measured on labels the system did not suggest, and every change to matching is judged by replaying recorded data, never by trying it live.
+
+**Measuring**
+
+- **Audit labels.** An Audit mode in the web UI plays a random clip without its label, proposal or model guess, and you say what it is. Audit labels are stored apart from exemplars and never become one, so the system is never graded on its own suggestions. 50–100 audited clips across the common sounds is the first test set.
+- **Replay: `creak eval`.** Replays the audited clips in time order from an empty exemplar set, simulating the loop: where the policy would ask, it learns the audited label; where it would tag automatically, the tag is scored against it. It reports questions asked, wrong automatic tags per label, the confusion between labels and a sweep over `match_threshold`. Policies are compared on the same recordings.
+- **In use.** A sample of automatic matches (every match below 0.9, one in ten above) goes to a quick "was this right?" check. With the corrected-after-match rate already in the log, that gives a running precision per label.
+
+**Protecting the exemplars**
+
+- Review shows the model's view next to the proposal and flags a conflict ("Music? · the model hears Cough"), with the model's class as its own one-key answer.
+- **Skip** answers a clip without creating an exemplar, for mixed or unclear clips. Today every answer creates one.
+- Correcting an automatic match shows the exemplar that caused it, with relabel or remove, so the cause is fixed rather than outvoted.
+
+**Candidate matching changes**, each kept only if the replay shows fewer wrong tags without many more questions:
+
+- A margin: tag automatically only when the best label beats the best other label by a margin.
+- Model consistency: an automatic match also needs the clip's model class to have been seen among that label's exemplars.
+- Centred embeddings: subtract the mean embedding of recent clips before comparing. YAMNet embeddings share a large common component, so unrelated sounds sit near 0.45 and the useful range is narrow.
+- Clean exemplars: a clip whose patches disagree is a poor exemplar; ask, or keep only the matching part.
+- Splitting a clip at a sharp new onset (a cough over typing), with the split clip embedded from around its onset, and grouping stitching continuous sounds back together.
+
+Already measured on Phase 0 data and rejected: embedding only the loudest patches (29 of 38 nearest labels right, against 35 of 38 for the plain mean).
 
 ## 4. CLI
 
@@ -219,11 +248,12 @@ Phase 0 replaces a separate offline spike: the questions it was meant to answer 
 | # | Phase | Delivers | Check |
 |---|---|---|---|
 | 0 | **Minimal deployable version** | `devices`, `run`, `events`, `label`, `setup`, `uninstall`. Capture, trigger, clips, YAMNet tagging, exemplar matching, retention by age. Web UI with Review, Events and Live. Release workflow for Linux x86_64 and aarch64, `install.sh`. | A fresh Ubuntu 24.04 machine or container goes from the one-liner to a running service and prints the UI URL; re-running it upgrades and keeps the config. The Live view moves with the room and clips sound right. A clap gives exactly one clip with pre-roll. Rust log-mel and embeddings match the TensorFlow reference on the fixture. After a few days with ~4 real sounds confirmed once each: the model's own top class is a sensible first guess for most clips, and there is a `match_threshold` where wrong matches stay under 5 % and at least half of the same-sound clips match from one exemplar. Model and thresholds are written into this plan. |
-| 1 | **Complete the core** | `calibrate`, `review`, `labels`, `doctor`. Labels view (rename, delete, corrected-match rate). Retention by size. 24 h soak. | No event storm and flat memory over 24 h. A wrong match corrected in the event log does not repeat. With `[web] enabled = false` the daemon still runs and `creak label` still works. |
-| 2 | **MQTT and Home Assistant** | Publishing, discovery, `label/set`. | Entities appear in HA without YAML. An automation fires on a matched event. An HA notification action confirms a tag. |
-| 3 | **Scenes** | `labels` table, `teach`, the one-minute sampler, scene state. | A movie is taught once; the next evening the scene turns on within 5 minutes and off within 5 minutes of the end. |
-| 4 | **LLM first guess, optional** | For clips with no close exemplar, ask an OpenAI-compatible endpoint with audio input for the proposed label, in place of the AudioSet class. Off by default. | Only build this if the model's own first guesses are too generic to be useful after Phase 1. |
-| 5 | **macOS and Windows** | Release builds for both. `setup` / `uninstall` install a launchd agent on macOS and a Windows service; platform default paths for config and data. Install via a script or a package manager. | On each OS: install, the Live view moves, a clap gives one clip, uninstall leaves nothing behind except data. |
+| 1 | **Accuracy** | §3.8: Audit mode, `creak eval`, the match check sample; conflict display, Skip and correct-to-cause in Review; candidate matching changes tried one at a time through the replay. | On at least 50 audited clips, the replay reports the wrong-tag rate and question count for the current policy, and every change kept lowers wrong tags without raising questions by more than a quarter. A cough over background music is tagged as a cough. |
+| 2 | **Complete the core** | `calibrate`, `review`, `labels`, `doctor`. Labels view (rename, delete, corrected-match rate). Retention by size. 24 h soak. | No event storm and flat memory over 24 h. A wrong match corrected in the event log does not repeat. With `[web] enabled = false` the daemon still runs and `creak label` still works. |
+| 3 | **MQTT and Home Assistant** | Publishing, discovery, `label/set`. | Entities appear in HA without YAML. An automation fires on a matched event. An HA notification action confirms a tag. |
+| 4 | **Scenes** | `labels` table, `teach`, the one-minute sampler, scene state. | A movie is taught once; the next evening the scene turns on within 5 minutes and off within 5 minutes of the end. |
+| 5 | **LLM first guess, optional** | For clips with no close exemplar, ask an OpenAI-compatible endpoint with audio input for the proposed label, in place of the AudioSet class. Off by default. | Only build this if the model's own first guesses are too generic to be useful after Phase 1. |
+| 6 | **macOS and Windows** | Release builds for both. `setup` / `uninstall` install a launchd agent on macOS and a Windows service; platform default paths for config and data. Install via a script or a package manager. | On each OS: install, the Live view moves, a clap gives one clip, uninstall leaves nothing behind except data. |
 
 ## 8. Packaging and distribution
 
@@ -263,12 +293,12 @@ CREAK_VERSION=v0.1.0 sh install.sh
 
 - The microphone belongs to the host. In an LXC or Docker container, pass through the capture nodes under `/dev/snd` and make sure the container's `audio` group owns them (or map the host's audio gid).
 - systemd hardening (`ProtectSystem`, `PrivateTmp`) needs namespace support; in an unprivileged LXC container enable nesting, or the unit fails with `226/NAMESPACE`.
-- No MQTT broker or Home Assistant is needed until Phase 2.
+- No MQTT broker or Home Assistant is needed until Phase 3.
 
 ## 10. Risks and open questions
 
 1. **Microphones with built-in processing.** Array microphones that apply voice-tuned noise suppression before the OS sees the signal may flatten the sounds this tool is for. Phase 0's first clips show it; a plain USB microphone is the fallback.
 2. **Doors and windows in other rooms.** One microphone hears a distant window poorly, and a contact sensor is more reliable for those. Expect the best results on sounds with no sensor: doorbell, appliances, alarms, party, movie.
-3. **Mean-pooling short sounds.** A door slam fills one or two patches; the active-segment rule in §3.2 keeps ambient out, but very short sounds may still need max-pooling or the loudest patch. Phase 0 data decides.
+3. **Short sounds inside longer clips.** A cough over typing or music is recorded but takes the clip's dominant label. Pooling only the loudest patches made matching worse (§3.8); splitting at onsets is the next candidate.
 4. **Rust.** Chosen for the single binary. The Python alternative would be a `uv tool install` package, with the same design and a heavier install.
-5. **Why not an existing tool.** bark-detector, ha-audio-events, sound-sensor-homeassistant, AudioClassifier-MQTT, Yamcam, Heyra and Frigate all classify into YAMNet's fixed labels. None learns your own sounds or has a confirm loop, and none uses an ambient-relative trigger. bark-detector's clip log and MQTT discovery are worth reading before Phases 1 and 2.
+5. **Why not an existing tool.** bark-detector, ha-audio-events, sound-sensor-homeassistant, AudioClassifier-MQTT, Yamcam, Heyra and Frigate all classify into YAMNet's fixed labels. None learns your own sounds or has a confirm loop, and none uses an ambient-relative trigger. bark-detector's clip log and MQTT discovery are worth reading before Phases 2 and 3.
