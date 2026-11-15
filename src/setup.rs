@@ -2,11 +2,13 @@
 //! systemd today; macOS (launchd) and Windows (service) come later.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
+use crate::config::Web;
 use anyhow::Result;
 use std::path::Path;
+use std::process::Command;
 
 #[cfg(target_os = "linux")]
-pub use linux::{setup, uninstall};
+pub use linux::{service, setup, uninstall};
 
 #[cfg(not(target_os = "linux"))]
 pub fn setup(_config_path: &Path) -> Result<()> {
@@ -16,6 +18,52 @@ pub fn setup(_config_path: &Path) -> Result<()> {
 #[cfg(not(target_os = "linux"))]
 pub fn uninstall(_config_path: &Path, _purge: bool) -> Result<()> {
     anyhow::bail!("`creak uninstall` supports Linux only for now")
+}
+
+/// The installed service, as `creak doctor` reports it.
+pub enum Service {
+    /// Not installed by `creak setup`.
+    Missing,
+    /// Installed but not running; the state as the service manager names it.
+    Stopped(String),
+    /// Running since `since`, as the service manager prints it, with the daemon's resident memory.
+    Running { since: String, rss_mb: Option<f64> },
+}
+
+/// None where creak cannot install a service yet.
+#[cfg(not(target_os = "linux"))]
+pub fn service() -> Option<Service> {
+    None
+}
+
+/// The web UI's address for a browser on another machine, with the token; None when it is off.
+pub fn web_url(web: &Web) -> Option<String> {
+    if !web.enabled {
+        return None;
+    }
+    let port = web.listen.rsplit(':').next().unwrap_or("8377");
+    let host = if web.listen.starts_with("127.") { "127.0.0.1".to_string() } else { lan_address() };
+    let query = if web.token.is_empty() { String::new() } else { format!("?token={}", web.token) };
+    Some(format!("http://{host}:{port}/{query}"))
+}
+
+/// This machine's first address, from `hostname -I` (Linux).
+fn lan_address() -> String {
+    Command::new("hostname")
+        .arg("-I")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.split_whitespace().next().map(str::to_string))
+        .unwrap_or_else(|| "<this-machine>".into())
+}
+
+/// Free space on the file system that holds `dir`, from POSIX `df` (Linux and macOS).
+pub fn free_bytes(dir: &Path) -> Option<u64> {
+    let out = Command::new("df").arg("-Pk").arg(dir).output().ok()?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    let available_kb: u64 = text.lines().nth(1)?.split_whitespace().nth(3)?.parse().ok()?;
+    Some(available_kb * 1024)
 }
 
 /// The config `setup` writes on first install: reachable from the LAN, protected by a token.
@@ -89,17 +137,14 @@ mod linux {
 
         let config_dir = config_path.parent().context("config path has no directory")?;
         fs::create_dir_all(config_dir)?;
-        let new_token = if config_path.exists() {
+        if config_path.exists() {
             println!("keeping existing {}", config_path.display());
-            None
         } else {
-            let token = random_token()?;
-            fs::write(config_path, initial_config(&token))?;
+            fs::write(config_path, initial_config(&random_token()?))?;
             run("chown", &[&format!("root:{USER}"), &config_path.to_string_lossy()])?;
             fs::set_permissions(config_path, fs::Permissions::from_mode(0o640))?;
             println!("wrote {}", config_path.display());
-            Some(token)
-        };
+        }
         let config = Config::load(config_path)?;
 
         let data_dir = &config.storage.dir;
@@ -114,14 +159,29 @@ mod linux {
         run("systemctl", &["restart", "creak"])?;
         println!("service creak (re)started; logs: journalctl -u creak -f");
 
-        if config.web.enabled {
-            let port = config.web.listen.rsplit(':').next().unwrap_or("8377");
-            let host = if config.web.listen.starts_with("127.") { "127.0.0.1".to_string() } else { lan_address() };
-            let token = new_token.unwrap_or(config.web.token);
-            let query = if token.is_empty() { String::new() } else { format!("?token={token}") };
-            println!("web UI: http://{host}:{port}/{query}");
+        if let Some(url) = web_url(&config.web) {
+            println!("web UI: {url}");
         }
         Ok(())
+    }
+
+    pub fn service() -> Option<Service> {
+        let out = Command::new("systemctl")
+            .args(["show", "creak", "--timestamp=utc", "-p", "LoadState,ActiveState,MainPID,ActiveEnterTimestamp"])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let property = |name: &str| text.lines().find_map(|l| l.strip_prefix(name)?.strip_prefix('=')).unwrap_or("");
+        Some(match (property("LoadState"), property("ActiveState")) {
+            ("not-found", _) => Service::Missing,
+            (_, "active") => {
+                let status = fs::read_to_string(format!("/proc/{}/status", property("MainPID"))).unwrap_or_default();
+                let rss_kb = status.lines().find_map(|l| l.strip_prefix("VmRSS:")?.split_whitespace().next());
+                let rss_mb = rss_kb.and_then(|kb| kb.parse::<f64>().ok()).map(|kb| kb / 1024.0);
+                Service::Running { since: property("ActiveEnterTimestamp").to_string(), rss_mb }
+            }
+            (_, state) => Service::Stopped(state.to_string()),
+        })
     }
 
     pub fn uninstall(config_path: &Path, purge: bool) -> Result<()> {
@@ -168,16 +228,6 @@ mod linux {
         let mut bytes = [0u8; 16];
         fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
         Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
-    }
-
-    fn lan_address() -> String {
-        Command::new("hostname")
-            .arg("-I")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .and_then(|s| s.split_whitespace().next().map(str::to_string))
-            .unwrap_or_else(|| "<this-machine>".into())
     }
 
     fn succeeds(cmd: &str, args: &[&str]) -> bool {

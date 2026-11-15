@@ -71,7 +71,35 @@ fn handle(
             json_reply(&json!({ "events": store.events(&filter)? }))
         }
         (Method::Get, ["api", "labels"]) => {
-            json_reply(&json!({ "labels": store.labels()?, "review": store.review_count()? }))
+            let stats = query.get("stats").is_some_and(|v| v == "1").then(|| store.label_stats()).transpose()?;
+            json_reply(&json!({ "labels": store.labels()?, "review": store.review_count()?, "stats": stats }))
+        }
+        (Method::Post, ["api", "labels", "rename"]) => {
+            #[derive(Deserialize)]
+            struct Body {
+                label: String,
+                to: String,
+            }
+            let Ok(body) = serde_json::from_str::<Body>(&read_body(request)?) else {
+                return Ok(text(400, "expected {\"label\": \"…\", \"to\": \"…\"}"));
+            };
+            match store.rename_label(&body.label, &body.to) {
+                Ok(n) => json_reply(&json!({ "exemplars": n })),
+                Err(e) => text(400, &format!("{e:#}")),
+            }
+        }
+        (Method::Post, ["api", "labels", "delete"]) => {
+            #[derive(Deserialize)]
+            struct Body {
+                label: String,
+            }
+            let Ok(body) = serde_json::from_str::<Body>(&read_body(request)?) else {
+                return Ok(text(400, "expected {\"label\": \"…\"}"));
+            };
+            match store.delete_label(&body.label) {
+                Ok(n) => json_reply(&json!({ "exemplars": n })),
+                Err(e) => text(400, &format!("{e:#}")),
+            }
         }
         (Method::Get, ["api", "settings"]) => settings_reply(file, store, settings)?,
         (Method::Patch, ["api", "settings"]) => {

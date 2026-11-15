@@ -271,11 +271,11 @@ mod tests {
 
     #[test]
     fn a_short_sound_runs_to_the_shortest_clip() {
-        // defaults: 2 s tail, but at least 4 s (200 frames) from the onset
+        // defaults: 2 s tail, but at least 15 s (750 frames) from the onset
         let mut t = warm(config::Trigger::default());
-        let events = [feed(&mut t, -30.0, 10), feed(&mut t, -50.0, 300)].concat();
+        let events = [feed(&mut t, -30.0, 10), feed(&mut t, -50.0, 800)].concat();
         let start = WARMUP_FRAMES as u64;
-        let close = Event::Close { end: start + 200, sound_end: start + 50, peak_db: -30.0, ambient_db: -50.0 };
+        let close = Event::Close { end: start + 750, sound_end: start + 50, peak_db: -30.0, ambient_db: -50.0 };
         assert_eq!(events, vec![Event::Open { start }, close]);
     }
 
@@ -320,13 +320,15 @@ mod tests {
     #[test]
     fn long_noise_is_cut_at_max_and_cooled_down() {
         let mut t = warm(config::Trigger::default());
-        let events = feed(&mut t, -20.0, 1500 + 100 + 3);
-        let start = WARMUP_FRAMES as u64;
+        // Enough quiet history that a minute of noise does not become the ambient level.
+        feed(&mut t, -50.0, 750);
+        let events = feed(&mut t, -20.0, 3000 + 100 + 3);
+        let start = (WARMUP_FRAMES + 750) as u64;
         assert_eq!(events[0], Event::Open { start });
-        // cut at max_clip_s (30 s = 1500 frames) with no tail, because the sound is still going
-        assert!(matches!(events[1], Event::Close { end, sound_end, .. } if end == start + 1500 && sound_end == end));
+        // cut at max_clip_s (60 s = 3000 frames) with no tail, because the sound is still going
+        assert!(matches!(events[1], Event::Close { end, sound_end, .. } if end == start + 3000 && sound_end == end));
         // the next clip needs the 2 s cooldown and then min_ms (3 frames) above the line
-        assert_eq!(events[2], Event::Open { start: start + 1500 + 100 });
+        assert_eq!(events[2], Event::Open { start: start + 3000 + 100 });
         assert_eq!(events.len(), 3);
     }
 }

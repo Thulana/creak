@@ -632,8 +632,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Quiet noise, then the fixture sound, then quiet again: one clip with pre-roll and tail,
-    /// tagged and stored as pending; after labelling it, the same sound is a match. Deaf, the
+    /// Quiet noise, then the fixture sound, then quiet again: one clip with pre-roll that runs
+    /// to the shortest clip length, tagged and stored as pending; after labelling it, the same sound is a match. Deaf, the
     /// same audio gives no clip.
     #[test]
     fn pipeline_from_audio_to_event() {
@@ -668,13 +668,14 @@ mod tests {
             assert!(err.to_string().contains("closed"));
             clips_rx.try_iter().collect::<Vec<Clip>>()
         };
-        let audio = [noise(16_000 * 6), sound.clone(), noise(16_000 * 5)].concat();
+        let audio = [noise(16_000 * 6), sound.clone(), noise(16_000 * 15)].concat();
         assert!(feed(audio.clone(), Mode::Deaf).is_empty());
         let clips = feed(audio.clone(), Mode::Active);
         assert_eq!(clips.len(), 1);
         assert_eq!(clips[0].onset, PRE_ROLL);
-        let tail = clips[0].samples.len() - clips[0].sound_end;
-        assert_eq!(tail, config.trigger.tail_ms as usize * 16, "{} samples past the sound", tail);
+        let from_onset = clips[0].samples.len() - clips[0].onset;
+        assert_eq!(from_onset, config.trigger.min_clip_s as usize * 16_000);
+        assert!(clips[0].sound_end < clips[0].samples.len(), "the padding after the sound is not part of it");
 
         let mut store = Store::open(&dir).unwrap();
         let tagger = Tagger::load().unwrap();
