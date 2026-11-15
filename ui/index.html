@@ -31,6 +31,10 @@
   .conflict { color: var(--warn); font-size: 15px; font-weight: 600; margin-left: 8px; }
   .row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
   .chip { background: var(--chip); border: 1px solid var(--line); color: var(--text); border-radius: 14px; padding: 2px 10px; font: inherit; font-size: 13px; cursor: pointer; }
+  .chip.bg { background: none; border-style: dashed; color: var(--muted); }
+  .mix .bg { color: var(--muted); }
+  .card.cause { border-color: var(--warn); }
+  h2.sub { font-size: 15px; margin: 22px 0 8px; }
   button.act { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text); padding: 6px 12px; border-radius: 7px; cursor: pointer; }
   button.act.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   button.act kbd { opacity: .7; font-size: 11px; margin-left: 4px; }
@@ -42,7 +46,7 @@
   .status.match, .status.confirmed { color: var(--ok); }
   .status.pending { color: var(--warn); }
   .status.corrected { color: var(--accent); }
-  .status.ignored { color: var(--muted); }
+  .status.ignored, .status.skipped { color: var(--muted); }
   .play { width: 30px; height: 30px; border-radius: 50%; border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; flex: none; }
   .play:disabled { opacity: .35; cursor: default; }
   .filters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
@@ -77,6 +81,7 @@
   <nav>
     <button data-view="review">Review<span class="badge" id="pending-badge" hidden></span></button>
     <button data-view="events">Events</button>
+    <button data-view="audit">Audit</button>
     <button data-view="live">Live</button>
     <button data-view="settings">Settings</button>
   </nav>
@@ -84,9 +89,10 @@
 </header>
 <main>
   <div class="err" id="error" hidden></div>
+  <div class="card cause" id="cause" hidden></div>
 
   <section id="view-review" hidden>
-    <p class="hint">Space play · Y confirm · M the model's sound · C correct · I ignore · J/K next/previous</p>
+    <p class="hint">Space play · Y confirm · M the other answer · C correct · S skip · I ignore · J/K next/previous</p>
     <div id="review-list"></div>
   </section>
 
@@ -95,15 +101,27 @@
       <select id="f-status">
         <option value="active">all but ignored</option>
         <option value="">all statuses</option>
-        <option>match</option><option>pending</option><option>confirmed</option><option>corrected</option><option>ignored</option>
+        <option>match</option><option>pending</option><option>confirmed</option><option>corrected</option><option>skipped</option><option>ignored</option>
       </select>
       <select id="f-label"><option value="">all labels</option></select>
     </div>
     <table>
-      <thead><tr><th></th><th>When</th><th>Status</th><th>Label</th><th class="wide-only">Nearest</th><th class="wide-only">Model</th><th class="wide-only">Length</th><th class="wide-only">Peak / ambient</th><th></th></tr></thead>
+      <thead><tr><th></th><th>When</th><th>Status</th><th>Label</th><th class="wide-only">Nearest</th><th class="wide-only">Model hears</th><th class="wide-only">Length</th><th class="wide-only">Peak / ambient</th><th></th></tr></thead>
       <tbody id="events-body"></tbody>
     </table>
     <p><button class="act" id="more">Load more</button></p>
+  </section>
+
+  <section id="view-audit" hidden>
+    <p class="hint">Say what each clip is, without seeing what creak thinks it is. These answers never teach creak: <code>creak eval</code> scores creak against them. 50–100 clips across your common sounds make a first test set.</p>
+    <div class="card" id="audit-card"></div>
+    <p class="hint" id="audit-progress"></p>
+    <h2 class="sub">Automatic tags, checked in Review</h2>
+    <table>
+      <thead><tr><th>Label</th><th>Matches</th><th>Corrected</th><th>Right</th><th>Wrong</th><th>Precision</th></tr></thead>
+      <tbody id="matches-body"></tbody>
+    </table>
+    <p class="hint">Review asks "right?" about every automatic tag below 0.9 similarity and one in ten above. Precision weighs each answer by how often its kind was sampled.</p>
   </section>
 
   <section id="view-live" hidden>
@@ -132,6 +150,7 @@
   </section>
 </main>
 <datalist id="known-labels"></datalist>
+<datalist id="audit-labels"></datalist>
 <audio id="player" preload="none"></audio>
 
 <script>
@@ -181,29 +200,81 @@ function play(id, button) {
 player.addEventListener('ended', () => document.querySelectorAll('.play').forEach((b) => b.textContent = '▶'));
 player.addEventListener('pause', () => document.querySelectorAll('.play').forEach((b) => b.textContent = '▶'));
 
+// Returns { event, cause }: cause is the taught example behind an automatic tag that was just corrected.
 async function setLabel(id, label) {
   const res = await api('/api/events/' + id + '/label', { method: 'POST', body: JSON.stringify({ label }) });
   refreshLabels();
-  return res.event;
+  return res;
 }
 
-// ---- labels and pending count
+const pct = (v) => Math.round(v * 100) + ' %';
+// The sound mix, most present first; sounds already there before the onset are muted.
+function mixChips(e, n = 6) {
+  if (!e.mix || !e.mix.length) return (e.top_classes || []).map(([name, score]) => `<button class="chip" data-pick="${esc(name)}">${esc(name)} ${pct(score)}</button>`).join('');
+  return e.mix.slice(0, n).map((p) => `<button class="chip ${p.background ? 'bg' : ''}" data-pick="${esc(p.class)}" title="${p.background ? 'Already there before the sound. ' : ''}In ${pct(p.share)} of the clip, best score ${pct(p.peak)}.">${esc(p.class)} ${pct(p.share)}</button>`).join('');
+}
+function mixText(e, n = 3) {
+  if (!e.mix || !e.mix.length) return esc(e.top_classes?.[0]?.[0] ?? '');
+  return e.mix.slice(0, n).map((p) => `<span class="${p.background ? 'bg' : ''}">${esc(p.class)} ${pct(p.share)}</span>`).join(' · ');
+}
+// A proposal that came from a sound heard over the background, rather than from the nearest example.
+const fromForeground = (e) => e.conflict && e.label === e.conflict.toLowerCase().replace(/\s+/g, ' ').trim();
+// The second answer offered next to a conflicting proposal.
+const otherAnswer = (e) => !e.conflict ? null : fromForeground(e) ? e.nearest_label : e.conflict;
+const isCheck = (e) => e.status === 'match' && e.checked === 'due';
+
+// ---- the example behind a corrected automatic tag
+function showCause(cause) {
+  const el = $('cause');
+  el.dataset.id = cause.id;
+  el.innerHTML = `
+    <b>It was tagged "${esc(cause.label)}" because of this taught example, #${cause.id}.</b>
+    <p class="hint">If the example itself is labelled wrong, fix it here, or the same mistake comes back.</p>
+    <div class="row">
+      <button class="play" data-play="${cause.id}" ${cause.clip_path ? '' : 'disabled'}>▶</button>
+      <span class="hint mix">${fmtTime(cause.ts)} · ${mixText(cause)}</span>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <input type="text" list="known-labels" placeholder="its right label" data-cause-input>
+      <button class="act" data-cause-relabel>Relabel</button>
+      <button class="act" data-cause-remove title="Stop using this clip as an example">Remove</button>
+      <button class="act" data-cause-keep>It is right</button>
+    </div>`;
+  el.hidden = false;
+}
+$('cause').addEventListener('click', async (ev) => {
+  const el = $('cause'), id = Number(el.dataset.id);
+  const input = el.querySelector('[data-cause-input]');
+  if (ev.target.closest('[data-play]')) play(id, ev.target.closest('[data-play]'));
+  else if (ev.target.closest('[data-cause-relabel]')) {
+    if (!input.value.trim()) { input.focus(); return; }
+    await setLabel(id, input.value);
+    el.hidden = true;
+  } else if (ev.target.closest('[data-cause-remove]')) {
+    await api('/api/events/' + id + '/skip', { method: 'POST' });
+    refreshLabels();
+    el.hidden = true;
+  } else if (ev.target.closest('[data-cause-keep]')) el.hidden = true;
+  if (el.hidden && view === 'events') loadEvents(false);
+});
+
+// ---- labels and the review count
 let knownLabels = [];
 async function refreshLabels() {
-  const { labels, pending } = await api('/api/labels');
+  const { labels, review } = await api('/api/labels');
   knownLabels = labels.map((l) => l.label);
   $('known-labels').innerHTML = knownLabels.map((l) => `<option value="${esc(l)}">`).join('');
   const sel = $('f-label'), current = sel.value;
   sel.innerHTML = '<option value="">all labels</option>' + knownLabels.map((l) => `<option>${esc(l)}</option>`).join('');
   sel.value = current;
-  $('pending-badge').textContent = pending;
-  $('pending-badge').hidden = pending === 0;
+  $('pending-badge').textContent = review;
+  $('pending-badge').hidden = review === 0;
 }
 
 // ---- review
 let queue = [], cursor = 0;
 async function loadReview() {
-  const { events } = await api('/api/events?status=pending&limit=200');
+  const { events } = await api('/api/events?review=1&limit=200');
   queue = events;
   cursor = Math.min(cursor, Math.max(queue.length - 1, 0));
   renderReview();
@@ -217,27 +288,47 @@ function renderReview() {
         <button class="play" data-play="${e.id}" ${e.clip_path ? '' : 'disabled'}>▶</button>
         <span class="hint">#${e.id} · ${fmtTime(e.ts)} · ${fmtDuration(e)} · peak ${fmtDb(e.peak_db)} dB over ${fmtDb(e.ambient_db)}</span>
       </div>
-      <div class="question">${esc(cap(e.label))}?${e.conflict ? `<span class="conflict">the model hears ${esc(e.conflict)}</span>` : ''}</div>
+      ${isCheck(e) ? `
+      <div class="question">${esc(cap(e.label))}, right?</div>
+      <p class="hint">Tagged without asking, ${e.similarity.toFixed(2)} similar to a taught example. A few of these are checked to measure how often creak is right.</p>` : `
+      <div class="question">${esc(cap(e.label))}?${!e.conflict ? '' : fromForeground(e)
+        ? `<span class="conflict">came in over ${esc(e.mix.filter((p) => p.background).map((p) => p.class).slice(0, 2).join(', ') || e.nearest_label)}</span>`
+        : `<span class="conflict">the model hears ${esc(e.conflict)}</span>`}</div>`}
       <div class="row" style="margin-bottom:10px">
-        ${(e.top_classes || []).map(([name, score]) => `<button class="chip" data-pick="${esc(name)}">${esc(name)} ${(score * 100).toFixed(0)}%</button>`).join('')}
-        ${e.nearest_label ? `<span class="hint">nearest: ${esc(e.nearest_label)} ${e.similarity.toFixed(2)}</span>` : ''}
+        ${mixChips(e)}
+        ${e.nearest_label && !isCheck(e) ? `<span class="hint">nearest: ${esc(e.nearest_label)} ${e.similarity.toFixed(2)}</span>` : ''}
       </div>
       <div class="row">
-        <button class="act primary" data-confirm>Confirm<kbd>Y</kbd></button>
-        ${e.conflict ? `<button class="act" data-model>${esc(e.conflict)}<kbd>M</kbd></button>` : ''}
-        <input type="text" list="known-labels" placeholder="or type a label" data-input>
+        ${isCheck(e) ? '<button class="act primary" data-right>Right<kbd>Y</kbd></button>' : '<button class="act primary" data-confirm>Confirm<kbd>Y</kbd></button>'}
+        ${otherAnswer(e) ? `<button class="act" data-other>${esc(otherAnswer(e))}<kbd>M</kbd></button>` : ''}
+        <input type="text" list="known-labels" placeholder="${isCheck(e) ? 'or what it is' : 'or type a label'}" data-input>
         <button class="act" data-correct>Correct<kbd>C</kbd></button>
+        ${isCheck(e) ? '<button class="act" data-unsure title="Drop this check">Can\'t tell<kbd>S</kbd></button>'
+          : '<button class="act" data-skip title="Answer without teaching: for mixed or unclear clips">Skip<kbd>S</kbd></button>'}
         <button class="act" data-ignore>Ignore<kbd>I</kbd></button>
       </div>
     </div>`).join('');
 }
-async function answer(i, label) {
-  const e = queue[i];
-  if (!label) return;
-  await setLabel(e.id, label);
+function settled(i) {
   queue.splice(i, 1);
   cursor = Math.min(i, Math.max(queue.length - 1, 0));
   renderReview();
+}
+async function answer(i, label) {
+  if (!label) return;
+  const { cause } = await setLabel(queue[i].id, label);
+  settled(i);
+  if (cause) showCause(cause);
+}
+async function skip(i) {
+  await api('/api/events/' + queue[i].id + '/skip', { method: 'POST' });
+  refreshLabels();
+  settled(i);
+}
+async function check(i, verdict) {
+  await api('/api/events/' + queue[i].id + '/check', { method: 'POST', body: JSON.stringify({ answer: verdict }) });
+  refreshLabels();
+  settled(i);
 }
 $('review-list').addEventListener('click', (ev) => {
   const card = ev.target.closest('.card[data-i]');
@@ -248,9 +339,12 @@ $('review-list').addEventListener('click', (ev) => {
   if (ev.target.closest('[data-play]')) play(e.id, ev.target.closest('[data-play]'));
   else if (ev.target.closest('[data-pick]')) { input.value = ev.target.closest('[data-pick]').dataset.pick.toLowerCase(); input.focus(); }
   else if (ev.target.closest('[data-confirm]')) answer(i, e.label);
+  else if (ev.target.closest('[data-right]')) check(i, 'right');
   else if (ev.target.closest('[data-correct]')) input.value.trim() ? answer(i, input.value) : input.focus();
   else if (ev.target.closest('[data-ignore]')) answer(i, 'ignore');
-  else if (ev.target.closest('[data-model]')) answer(i, e.conflict);
+  else if (ev.target.closest('[data-other]')) answer(i, otherAnswer(e));
+  else if (ev.target.closest('[data-skip]')) skip(i);
+  else if (ev.target.closest('[data-unsure]')) check(i, 'unsure');
 });
 $('review-list').addEventListener('keydown', (ev) => {
   if (ev.key === 'Enter' && ev.target.matches('[data-input]')) {
@@ -266,10 +360,11 @@ document.addEventListener('keydown', (ev) => {
   const move = (d) => { cursor = Math.max(0, Math.min(queue.length - 1, cursor + d)); renderReview(); document.querySelector('.card.current')?.scrollIntoView({ block: 'nearest' }); };
   switch (ev.key.toLowerCase()) {
     case ' ': ev.preventDefault(); if (e.clip_path) play(e.id, card.querySelector('[data-play]')); break;
-    case 'y': answer(cursor, e.label); break;
+    case 'y': isCheck(e) ? check(cursor, 'right') : answer(cursor, e.label); break;
     case 'c': ev.preventDefault(); card.querySelector('[data-input]').focus(); break;
     case 'i': answer(cursor, 'ignore'); break;
-    case 'm': if (e.conflict) answer(cursor, e.conflict); break;
+    case 'm': if (otherAnswer(e)) answer(cursor, otherAnswer(e)); break;
+    case 's': isCheck(e) ? check(cursor, 'unsure') : skip(cursor); break;
     case 'j': move(1); break;
     case 'k': move(-1); break;
   }
@@ -292,7 +387,7 @@ async function loadEvents(append) {
       <td><span class="status ${e.status}">${e.status}</span></td>
       <td>${esc(e.label)}${e.exemplar ? ' ★' : ''}</td>
       <td class="wide-only">${e.nearest_label ? esc(e.nearest_label) + ' ' + e.similarity.toFixed(2) : '–'}</td>
-      <td class="wide-only">${e.conflict ? `<span class="conflict" style="margin:0" title="The model contradicted the label, so this clip was asked about">${esc(e.conflict)} ≠</span>` : esc(e.top_classes?.[0]?.[0] ?? '')}</td>
+      <td class="wide-only mix">${e.conflict ? `<span class="conflict" style="margin:0" title="The model contradicted the nearest example, so this clip was asked about">${esc(e.conflict)} ≠</span> ` : ''}${mixText(e)}</td>
       <td class="wide-only">${fmtDuration(e)}</td>
       <td class="wide-only">${fmtDb(e.peak_db)} / ${fmtDb(e.ambient_db)}</td>
       <td><button class="act" data-relabel>Relabel</button></td>
@@ -308,9 +403,52 @@ $('events-body').addEventListener('click', async (ev) => {
   if (ev.target.closest('[data-play]')) play(id, ev.target.closest('[data-play]'));
   if (ev.target.closest('[data-relabel]')) {
     const label = prompt('Label for event #' + id + ' (or "ignore")' + (knownLabels.length ? '\nKnown: ' + knownLabels.join(', ') : ''));
-    if (label && label.trim()) { await setLabel(id, label); loadEvents(false); }
+    if (label && label.trim()) {
+      const { cause } = await setLabel(id, label);
+      loadEvents(false);
+      if (cause) showCause(cause);
+    }
   }
 });
+// ---- audit: answers given without seeing any label, which creak eval scores against
+let auditId = null;
+async function loadAudit() { renderAudit(await api('/api/audit'), false); }
+function renderAudit(a, autoplay) {
+  auditId = a.next;
+  const card = $('audit-card');
+  if (a.next == null) {
+    card.innerHTML = '<b>Every clip has been audited.</b><p class="hint">New clips appear here as they are recorded.</p>';
+  } else {
+    card.innerHTML = `
+      <div class="row"><button class="play" data-play="${a.next}">▶</button><span class="hint">A random clip. What made the sound that starts it?</span></div>
+      <div class="row" style="margin-top:10px">
+        <input type="text" list="audit-labels" placeholder="What is it?" id="audit-input" autocomplete="off">
+        <button class="act primary" id="audit-save">Save<kbd>Enter</kbd></button>
+        <button class="act" id="audit-unclear">Can't tell</button>
+      </div>`;
+    $('audit-input').focus();
+    if (autoplay) play(a.next, card.querySelector('[data-play]'));
+  }
+  const counts = a.labels.map((l) => `${esc(l.label)} ${l.clips}`).join(' · ');
+  $('audit-progress').innerHTML = `${a.audited} audited${a.unclear ? `, ${a.unclear} could not be told` : ''}${counts ? ' · ' + counts : ''}`;
+  const labels = new Set([...knownLabels, ...a.labels.map((l) => l.label)]);
+  $('audit-labels').innerHTML = [...labels].sort().map((l) => `<option value="${esc(l)}">`).join('');
+  $('matches-body').innerHTML = a.matches.length ? a.matches.map((m) => `
+    <tr><td>${esc(m.label)}</td><td>${m.matches}</td><td>${m.corrected}</td><td>${m.right}</td><td>${m.wrong}</td><td>${m.precision == null ? '–' : pct(m.precision)}</td></tr>`).join('')
+    : '<tr><td colspan="6" class="hint">No automatic tags yet.</td></tr>';
+}
+async function saveAudit(label) {
+  try { renderAudit(await api('/api/audit/' + auditId, { method: 'POST', body: JSON.stringify({ label }) }), true); } catch (_) {}
+}
+$('audit-card').addEventListener('click', (ev) => {
+  if (ev.target.closest('[data-play]')) play(auditId, ev.target.closest('[data-play]'));
+  else if (ev.target.closest('#audit-save')) { const v = $('audit-input').value.trim(); v ? saveAudit(v) : $('audit-input').focus(); }
+  else if (ev.target.closest('#audit-unclear')) saveAudit(null);
+});
+$('audit-card').addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter' && ev.target.id === 'audit-input' && ev.target.value.trim()) saveAudit(ev.target.value.trim());
+});
+
 $('f-status').addEventListener('change', () => loadEvents(false));
 $('f-label').addEventListener('change', () => loadEvents(false));
 $('more').addEventListener('click', () => loadEvents(true));
@@ -460,8 +598,10 @@ function show(name) {
   document.querySelectorAll('nav button').forEach((b) => b.classList.toggle('on', b.dataset.view === name));
   document.querySelectorAll('main > section').forEach((s) => s.hidden = s.id !== 'view-' + name);
   clearInterval(liveTimer);
+  $('cause').hidden = true;
   if (name === 'review') loadReview();
   if (name === 'events') loadEvents(false);
+  if (name === 'audit') loadAudit().catch(() => {});
   if (name === 'settings') loadSettings().catch(() => {});
   if (name === 'live') { loadTuning().catch(() => {}); pollLive(); liveTimer = setInterval(pollLive, 250); }
   try { localStorage.setItem('creak-view', name); } catch (_) {}
