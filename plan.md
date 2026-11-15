@@ -89,18 +89,41 @@ On day one there are no exemplars, so every clip is pending with the model's own
 - Pending clips are not published unless `publish_pending = true`.
 - **Label the sound that triggered the clip, not what was on in the background.** Background music belongs to scenes (§3.4). A cough confirmed as "music" because music was playing becomes a music exemplar, and the next cough is tagged "music" without a question. Phase 0 data had this for 9 of 16 music exemplars; §3.8 is about catching and preventing it.
 
-### 3.4 Scenes (party, movie, music)
+### 3.4 Mixed clips and scenes (party, movie, dinner)
 
-Scenes last for minutes or hours, so the trigger is the wrong tool: the ambient level rises with them.
+A clip often holds more than one sound: music, several voices, a laugh. Its tags are the mean over its patches, so it collapses to the strongest class ("Music") and the rest is lost. A scene such as a party lasts minutes or hours, and the trigger is the wrong tool for it: the ambient level rises with the scene, and the open line with it, exactly while the scene is on. Three layers, each useful on its own:
 
-- A label is either an `event` or a `scene`.
-- Teach a scene while it is happening: `creak teach party --for 10m` samples exemplars for that long.
-- Once any scene label exists, the daemon classifies the last 10 s every minute.
-- A scene turns on after 3 of the last 5 samples match and turns off after 5 misses in a row.
+**1. The sound mix of a clip.** YAMNet already scores every 0.96 s patch. For each sound class (the `sounds` of §3.2, so no room tone), keep the share of the clip's patches in which it scores at least `sound_score`, and its peak. It is stored per event as `mix` (the top eight or so) and shown in Review and Events as "Speech 70 % · Music 55 % · Laughter 20 %". A clip with two or more sounds, each in at least a quarter of its patches, is *mixed*.
+
+- **Foreground and background.** Classes already present in the pre-roll are background; classes that appear only after the onset are what triggered the clip. An event's proposal comes from the foreground, so a cough over music is proposed as a cough (§3.8, risk 3). The pre-roll is run through the model for this comparison only; it is still not embedded.
+
+**2. A scene sampler, independent of the trigger.** Every `scene_every_s` (60 s) the daemon tags the last 10 s of audio, whether or not a clip is open; never in deaf mode. A scene window is the last `scene_window_min` (5) minutes of samples, plus the mixes of the clips cut in it. Its fingerprint is the mean presence of each class over the window and the mean embedding.
+
+**3. Naming a scene: the model guesses, you confirm.** The same loop as for events.
+
+- **First guess** without any teaching, from a small table of AudioSet classes in `classify.rs`:
+
+  | Scene | Needs, across the window |
+  |---|---|
+  | party | Music, and Chatter / Hubbub / Crowd, and Laughter / Cheering / Clapping |
+  | tv or movie | Television, or Speech and Music, steady for most of the window |
+  | cooking | Frying / Sizzle / Dishes / Microwave / Water tap |
+  | dinner | Speech, and Cutlery / Dishes |
+  | cleaning | Vacuum cleaner / Washing machine / Dishwasher |
+
+- **Review** gets a second kind of card for a window that a rule matches but no taught scene does: "Party? · music, chatter, laughter for 12 min", with confirm, correct and ignore. The answer stores the window's fingerprint as a scene exemplar. A scene can also be taught while it happens: `creak teach party --for 10m`.
+- **Matching** is cosine similarity of the fingerprint to the scene exemplars, with the event thresholds. A scene turns on after 3 of the last 5 samples match and off after 5 misses in a row.
+- Events during a scene carry it (`scene` column), so "a glass breaking during the party" can be found, and the scene's classes count as background when a clip in it is proposed a label.
+- `labels(name, kind)` records whether a label is an `event` or a `scene`.
+
+**Considered and not chosen**
+
+- A text description from an LLM ("sounds like a party: music, many voices, laughter"). It can work from the class timeline alone, so no audio leaves the machine, but the rule table and taught scenes cover the need. It stays an option next to Phase 5.
+- Zero-shot audio–text models (CLAP), where a scene is described in words. Most general, but the model is about ten times YAMNet's size: too heavy for a small always-on box and the single binary.
 
 ### 3.5 Storage and privacy
 
-- `events(id, ts, duration_ms, peak_db, ambient_db, label, status, similarity, nearest_label, top_classes, clip_path, embedding)`
+- `events(id, ts, duration_ms, peak_db, ambient_db, label, status, similarity, nearest_label, top_classes, clip_path, embedding, parts, conflict)`; the sound mix and the scene (§3.4) add `mix` and `scene`.
 - `exemplars(id, event_id, label, embedding, created_ts)`; the clip is the event's.
 - `labels(name, kind)` arrives with scenes; until then labels are derived from exemplars.
 - Clips will contain conversations. They never leave the machine.
@@ -160,6 +183,7 @@ One confirmation is enough only if confirmations are right. Phase 0 showed they 
 - Centred embeddings: subtract the mean embedding of recent clips before comparing. YAMNet embeddings share a large common component, so unrelated sounds sit near 0.45 and the useful range is narrow.
 - Clean exemplars: a clip whose patches disagree is a poor exemplar; ask, or keep only the matching part.
 - Splitting a clip at a sharp new onset (a cough over typing), with the split clip embedded from around its onset, and grouping stitching continuous sounds back together.
+- Proposing from the foreground: the classes of the sound mix that are not already in the pre-roll (§3.4).
 
 Already measured on Phase 0 data and rejected: embedding only the loudest patches (29 of 38 nearest labels right, against 35 of 38 for the plain mean).
 
@@ -261,10 +285,10 @@ Phase 0 replaces a separate offline spike: the questions it was meant to answer 
 | # | Phase | Delivers | Check |
 |---|---|---|---|
 | 0 | **Minimal deployable version** | `devices`, `run`, `events`, `label`, `setup`, `uninstall`. Capture, trigger, clips, YAMNet tagging, exemplar matching, retention by age. Web UI with Review, Events and Live. Release workflow for Linux x86_64 and aarch64, `install.sh`. | A fresh Ubuntu 24.04 machine or container goes from the one-liner to a running service and prints the UI URL; re-running it upgrades and keeps the config. The Live view moves with the room and clips sound right. A clap gives exactly one clip with pre-roll. Rust log-mel and embeddings match the TensorFlow reference on the fixture. After a few days with ~4 real sounds confirmed once each: the model's own top class is a sensible first guess for most clips, and there is a `match_threshold` where wrong matches stay under 5 % and at least half of the same-sound clips match from one exemplar. Model and thresholds are written into this plan. |
-| 1 | **Accuracy** | §3.8: Audit mode, `creak eval`, the match check sample; conflict display, Skip and correct-to-cause in Review; candidate matching changes tried one at a time through the replay. | On at least 50 audited clips, the replay reports the wrong-tag rate and question count for the current policy, and every change kept lowers wrong tags without raising questions by more than a quarter. A cough over background music is tagged as a cough. |
+| 1 | **Accuracy** | §3.8: Audit mode, `creak eval`, the match check sample; conflict display, Skip and correct-to-cause in Review; the sound mix of a clip and its foreground (§3.4, layer 1); candidate matching changes tried one at a time through the replay. | On at least 50 audited clips, the replay reports the wrong-tag rate and question count for the current policy, and every change kept lowers wrong tags without raising questions by more than a quarter. A cough over background music is tagged as a cough. |
 | 2 | **Complete the core** | `calibrate`, `review`, `labels`, `doctor`. Labels view (rename, delete, corrected-match rate). Retention by size. 24 h soak. | No event storm and flat memory over 24 h. A wrong match corrected in the event log does not repeat. With `[web] enabled = false` the daemon still runs and `creak label` still works. |
 | 3 | **MQTT and Home Assistant** | Publishing, discovery, `label/set`, `mode/set`. | Entities appear in HA without YAML. An automation fires on a matched event. An HA notification action confirms a tag. |
-| 4 | **Scenes** | `labels` table, `teach`, the one-minute sampler, scene state. | A movie is taught once; the next evening the scene turns on within 5 minutes and off within 5 minutes of the end. |
+| 4 | **Scenes** | §3.4 layers 2 and 3: `labels` table, the scene sampler, the rule table, scene cards in Review, `teach`, scene state, the `scene` column on events. | A party is proposed by the rule table the first time it happens. A movie is taught once; the next evening the scene turns on within 5 minutes and off within 5 minutes of the end. |
 | 5 | **LLM first guess, optional** | For clips with no close exemplar, ask an OpenAI-compatible endpoint with audio input for the proposed label, in place of the AudioSet class. Off by default. | Only build this if the model's own first guesses are too generic to be useful after Phase 1. |
 | 6 | **macOS and Windows** | Release builds for both. `setup` / `uninstall` install a launchd agent on macOS and a Windows service; platform default paths for config and data. Install via a script or a package manager. | On each OS: install, the Live view moves, a clap gives one clip, uninstall leaves nothing behind except data. |
 
@@ -312,6 +336,6 @@ CREAK_VERSION=v0.1.0 sh install.sh
 
 1. **Microphones with built-in processing.** Array microphones that apply voice-tuned noise suppression before the OS sees the signal may flatten the sounds this tool is for. Phase 0's first clips show it; a plain USB microphone is the fallback.
 2. **Doors and windows in other rooms.** One microphone hears a distant window poorly, and a contact sensor is more reliable for those. Expect the best results on sounds with no sensor: doorbell, appliances, alarms, party, movie.
-3. **Short sounds inside longer clips.** A cough over typing or music is recorded but takes the clip's dominant label. Pooling only the loudest patches made matching worse (§3.8); splitting at onsets is the next candidate.
+3. **Short sounds inside longer clips.** A cough over typing or music is recorded but takes the clip's dominant label. Pooling only the loudest patches made matching worse (§3.8); the foreground of the sound mix (§3.4) and splitting at onsets are the next candidates.
 4. **Rust.** Chosen for the single binary. The Python alternative would be a `uv tool install` package, with the same design and a heavier install.
 5. **Why not an existing tool.** bark-detector, ha-audio-events, sound-sensor-homeassistant, AudioClassifier-MQTT, Yamcam, Heyra and Frigate all classify into YAMNet's fixed labels. None learns your own sounds or has a confirm loop, and none uses an ambient-relative trigger. bark-detector's clip log and MQTT discovery are worth reading before Phases 2 and 3.
