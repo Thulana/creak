@@ -1,6 +1,8 @@
 # creak
 
-creak listens to one microphone, cuts a clip whenever something is louder than the room usually is, and tags it: door, doorbell, kettle, whatever you call it. A pretrained audio model makes the first guess. You confirm or correct it once, and from then on anything that sounds like that clip is tagged without asking.
+*It heard that.*
+
+creak listens to one microphone, cuts a clip whenever something is louder than the room usually is, and tags it: door, doorbell, kettle, whatever you call it. A pretrained audio model makes the first guess and you confirm or correct it. Every answer teaches it: once a sound has been confirmed, clips that sound like it are tagged without asking, unless the model hears something that contradicts the label, in which case it asks again.
 
 It is a single binary with a small web UI. Clips stay on the machine.
 

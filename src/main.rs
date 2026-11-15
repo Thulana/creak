@@ -12,7 +12,7 @@ use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-/// Learns the sounds of your home from one confirmation each.
+/// It heard that: learns the sounds of your home from your answers.
 #[derive(Parser)]
 #[command(version)]
 struct Cli {

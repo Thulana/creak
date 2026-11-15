@@ -2,7 +2,7 @@
 
 _Written 2026-11-15. Status: Phase 0 (minimal deployable version) in review; Phase 1 (accuracy) next._
 
-`creak` is a single-binary daemon that listens to one microphone all the time, cuts a clip whenever the sound rises above `n ×` the ambient level, lets a model tag the clip (door, doorbell, party, movie…), logs it, and publishes it to Home Assistant over MQTT. It then asks you whether the tag is right. One confirmation is enough: from then on, anything that sounds like that clip is tagged and published without asking.
+`creak` is a single-binary daemon that listens to one microphone all the time, cuts a clip whenever the sound rises above `n ×` the ambient level, lets a model tag the clip (door, doorbell, party, movie…), logs it, and publishes it to Home Assistant over MQTT. It then asks you whether the tag is right. A confirmation is usually enough: from then on, anything that sounds like that clip is tagged and published without asking, unless the model hears something that contradicts the label (§3.2).
 
 Linux comes first. macOS and Windows follow later (Phase 6), so platform-specific code stays in one module.
 
@@ -12,7 +12,7 @@ Linux comes first. macOS and Windows follow later (Phase 6), so platform-specifi
 
 - Always-on capture from one input device, with an ambient-relative trigger.
 - Clips and an event log on local disk.
-- Every clip gets a tag proposed by the model first. You confirm or correct it, and one confirmation makes that tag automatic. Labels are yours; there is no fixed list.
+- Every clip gets a tag proposed by the model first. You confirm or correct it, and a confirmation usually makes that tag automatic. Labels are yours; there is no fixed list.
 - A confirm / correct / ignore loop in a web UI that plays each clip, and in the CLI.
 - MQTT publishing with Home Assistant discovery.
 - `curl | sh` install, systemd service, upgrade and uninstall.
@@ -80,7 +80,7 @@ On day one there are no exemplars, so every clip is pending with the model's own
 ### 3.3 Feedback loop
 
 - You answer a pending clip with confirm, correct (pick or type another label) or ignore. Any of the three stores the clip as an exemplar for the chosen label.
-- **One confirmation is enough.** You know what happened and when, so a confirmed clip is ground truth. There is no minimum count and no trust score: a label with one exemplar already produces matches.
+- **One confirmation is usually enough.** You know what happened and when, so a confirmed clip is ground truth. There is no minimum count and no trust score: a label with one exemplar already produces matches. It asks again only when the model contradicts the label (§3.2).
 - Reliability comes from `match_threshold`, not from repetition. A sound that differs from the exemplar (the same door closed gently) falls below it, is asked about once, and then matches as well.
 - A wrong match can be corrected afterwards in the event log. The clip becomes an exemplar for the right label, so the nearest exemplar is the right one next time.
 - Pending clips are not published unless `publish_pending = true`.
