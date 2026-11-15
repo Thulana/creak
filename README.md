@@ -1,6 +1,8 @@
 # creak
 
-creak listens to one microphone, cuts a clip whenever something is louder than the room usually is, and tags it: door, doorbell, kettle, whatever you call it. A pretrained audio model makes the first guess. You confirm or correct it once, and from then on anything that sounds like that clip is tagged without asking.
+*It heard that.*
+
+creak listens to one microphone, cuts a clip whenever something is louder than the room usually is, and tags it: door, doorbell, kettle, whatever you call it. A pretrained audio model makes the first guess and you confirm or correct it. Every answer teaches it: once a sound has been confirmed, clips that sound like it are tagged without asking, unless the model hears something that contradicts the label, in which case it asks again.
 
 It is a single binary with a small web UI. Clips stay on the machine.
 
@@ -36,10 +38,14 @@ Open that link from any device on your network. The token is stored in `/etc/cre
 ## Using it
 
 - **Live** shows the microphone level, the ambient level and the line a sound has to cross. Check it first: if the level does not move when you talk, the wrong device is selected (`creak devices`, then `[audio] device` in the config). The sliders below the graph move the open line, the close line and the ambient floor while you watch; they are saved and override the config file until you press Reset.
-- **Review** lists clips waiting for an answer, each with the model's guess as a question ("Door?"). Play it, then confirm (`Y`), type the right label and correct (`C`), or ignore (`I`). Space plays, `J`/`K` move.
+- **Review** lists clips waiting for an answer, each with a proposed label as a question ("Door?"). Play it, then confirm (`Y`), type the right label and correct (`C`), or ignore (`I`). When the model disagrees with the proposal the card says so ("Music? · the model hears Cough") and `M` answers with the model's sound. Space plays, `J`/`K` move.
+
+  A clip is asked about when no taught clip is close enough to tag it, or when one is close but the model is sure it hears a different sound than that label's taught clips. Everything else is tagged without asking.
 - **Events** is the full log, with the nearest learned sound and its similarity for every clip. A wrong match can be relabelled here.
 
 One answer per sound is enough. A clip you confirm becomes an example; the next clip whose similarity to it is above `match_threshold` gets its label automatically. `ignore` works the same way, for sounds you never want to hear about again.
+
+Label the sound that triggered the clip, not what was playing in the background: a cough confirmed as "music" teaches creak that coughs are music. Clips in which the model hears nothing but silence or room tone are dropped without a trace, so there is no `silence` label.
 
 ## Configuration
 
@@ -59,7 +65,7 @@ cooldown_s = 2
 ambient_floor_db = -60    # ambient is the 10th percentile of the last 5 minutes, never below this
 
 [classify]
-match_threshold = 0.80    # cosine similarity to a confirmed clip that applies its label
+match_threshold = 0.85    # cosine similarity to a confirmed clip that applies its label; higher asks more often
 suggest_threshold = 0.60  # above this, the nearest label is proposed instead of the model's guess
 group_gap_s = 10          # a same-label clip within this many seconds extends the previous event; 0 = off
 

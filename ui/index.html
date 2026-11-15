@@ -28,6 +28,7 @@
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 10px; }
   .card.current { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
   .question { font-size: 22px; font-weight: 600; margin: 2px 0 6px; }
+  .conflict { color: var(--warn); font-size: 15px; font-weight: 600; margin-left: 8px; }
   .row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
   .chip { background: var(--chip); border: 1px solid var(--line); color: var(--text); border-radius: 14px; padding: 2px 10px; font: inherit; font-size: 13px; cursor: pointer; }
   button.act { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text); padding: 6px 12px; border-radius: 7px; cursor: pointer; }
@@ -74,7 +75,7 @@
   <div class="err" id="error" hidden></div>
 
   <section id="view-review" hidden>
-    <p class="hint">Space play · Y confirm · C correct · I ignore · J/K next/previous</p>
+    <p class="hint">Space play · Y confirm · M the model's sound · C correct · I ignore · J/K next/previous</p>
     <div id="review-list"></div>
   </section>
 
@@ -198,13 +199,14 @@ function renderReview() {
         <button class="play" data-play="${e.id}" ${e.clip_path ? '' : 'disabled'}>▶</button>
         <span class="hint">#${e.id} · ${fmtTime(e.ts)} · ${fmtDuration(e)} · peak ${fmtDb(e.peak_db)} dB over ${fmtDb(e.ambient_db)}</span>
       </div>
-      <div class="question">${esc(cap(e.label))}?</div>
+      <div class="question">${esc(cap(e.label))}?${e.conflict ? `<span class="conflict">the model hears ${esc(e.conflict)}</span>` : ''}</div>
       <div class="row" style="margin-bottom:10px">
         ${(e.top_classes || []).map(([name, score]) => `<button class="chip" data-pick="${esc(name)}">${esc(name)} ${(score * 100).toFixed(0)}%</button>`).join('')}
         ${e.nearest_label ? `<span class="hint">nearest: ${esc(e.nearest_label)} ${e.similarity.toFixed(2)}</span>` : ''}
       </div>
       <div class="row">
         <button class="act primary" data-confirm>Confirm<kbd>Y</kbd></button>
+        ${e.conflict ? `<button class="act" data-model>${esc(e.conflict)}<kbd>M</kbd></button>` : ''}
         <input type="text" list="known-labels" placeholder="or type a label" data-input>
         <button class="act" data-correct>Correct<kbd>C</kbd></button>
         <button class="act" data-ignore>Ignore<kbd>I</kbd></button>
@@ -230,6 +232,7 @@ $('review-list').addEventListener('click', (ev) => {
   else if (ev.target.closest('[data-confirm]')) answer(i, e.label);
   else if (ev.target.closest('[data-correct]')) input.value.trim() ? answer(i, input.value) : input.focus();
   else if (ev.target.closest('[data-ignore]')) answer(i, 'ignore');
+  else if (ev.target.closest('[data-model]')) answer(i, e.conflict);
 });
 $('review-list').addEventListener('keydown', (ev) => {
   if (ev.key === 'Enter' && ev.target.matches('[data-input]')) {
@@ -248,6 +251,7 @@ document.addEventListener('keydown', (ev) => {
     case 'y': answer(cursor, e.label); break;
     case 'c': ev.preventDefault(); card.querySelector('[data-input]').focus(); break;
     case 'i': answer(cursor, 'ignore'); break;
+    case 'm': if (e.conflict) answer(cursor, e.conflict); break;
     case 'j': move(1); break;
     case 'k': move(-1); break;
   }
@@ -270,7 +274,7 @@ async function loadEvents(append) {
       <td><span class="status ${e.status}">${e.status}</span></td>
       <td>${esc(e.label)}${e.exemplar ? ' ★' : ''}</td>
       <td class="wide-only">${e.nearest_label ? esc(e.nearest_label) + ' ' + e.similarity.toFixed(2) : '–'}</td>
-      <td class="wide-only">${esc(e.top_classes?.[0]?.[0] ?? '')}</td>
+      <td class="wide-only">${e.conflict ? `<span class="conflict" style="margin:0" title="The model contradicted the label, so this clip was asked about">${esc(e.conflict)} ≠</span>` : esc(e.top_classes?.[0]?.[0] ?? '')}</td>
       <td class="wide-only">${fmtDuration(e)}</td>
       <td class="wide-only">${fmtDb(e.peak_db)} / ${fmtDb(e.ambient_db)}</td>
       <td><button class="act" data-relabel>Relabel</button></td>
