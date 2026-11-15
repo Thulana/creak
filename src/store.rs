@@ -1,10 +1,11 @@
 //! SQLite event log, exemplars and clip files under the storage directory.
 
 use crate::classify::{self, Exemplar};
-use crate::config::Tuning;
+use crate::config::{Mode, Overrides};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 
 const SCHEMA: &str = "
@@ -38,7 +39,10 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 ";
 
-const TRIGGER_KEY: &str = "trigger";
+const OVERRIDES_KEY: &str = "overrides";
+const MODE_KEY: &str = "mode";
+/// Databases from creak 0.1 hold the Live view's trigger values under this key.
+const OLD_TRIGGER_KEY: &str = "trigger";
 
 pub struct Store {
     conn: Connection,
@@ -107,7 +111,16 @@ impl Store {
                 conn.execute_batch(&format!("ALTER TABLE events ADD COLUMN {definition}"))?;
             }
         }
-        Ok(Self { conn, dir: dir.to_path_buf() })
+        let store = Self { conn, dir: dir.to_path_buf() };
+        if let Some(old) = store.setting::<Overrides>(OLD_TRIGGER_KEY)? {
+            let mut overrides = store.overrides()?;
+            for (name, value) in old {
+                overrides.entry(format!("trigger.{name}")).or_insert(value);
+            }
+            store.set_overrides(&overrides)?;
+            store.conn.execute("DELETE FROM settings WHERE key = ?1", [OLD_TRIGGER_KEY])?;
+        }
+        Ok(store)
     }
 
     pub fn dir(&self) -> &Path {
@@ -150,22 +163,36 @@ impl Store {
         Ok(())
     }
 
-    pub fn trigger_tuning(&self) -> Result<Option<Tuning>> {
+    /// Settings changed in the web UI; empty means the config file applies unchanged.
+    pub fn overrides(&self) -> Result<Overrides> {
+        Ok(self.setting(OVERRIDES_KEY)?.unwrap_or_default())
+    }
+
+    pub fn set_overrides(&self, overrides: &Overrides) -> Result<()> {
+        self.set_setting(OVERRIDES_KEY, overrides)
+    }
+
+    pub fn mode(&self) -> Result<Mode> {
+        Ok(self.setting(MODE_KEY)?.unwrap_or_default())
+    }
+
+    pub fn set_mode(&self, mode: Mode) -> Result<()> {
+        self.set_setting(MODE_KEY, &mode)
+    }
+
+    /// A stored setting; one that no longer parses counts as missing.
+    fn setting<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
         let value: Option<String> =
-            self.conn.query_row("SELECT value FROM settings WHERE key = ?1", [TRIGGER_KEY], |r| r.get(0)).optional()?;
+            self.conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0)).optional()?;
         Ok(value.and_then(|v| serde_json::from_str(&v).ok()))
     }
 
-    /// Stores trigger values changed in the Live view; `None` goes back to the config file.
-    pub fn set_trigger_tuning(&self, tuning: Option<&Tuning>) -> Result<()> {
-        match tuning {
-            Some(t) => self.conn.execute(
-                "INSERT INTO settings (key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![TRIGGER_KEY, serde_json::to_string(t)?],
-            )?,
-            None => self.conn.execute("DELETE FROM settings WHERE key = ?1", [TRIGGER_KEY])?,
-        };
+    fn set_setting<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, serde_json::to_string(value)?],
+        )?;
         Ok(())
     }
 
@@ -175,12 +202,8 @@ impl Store {
         )?;
         let rows = stmt.query_map([], |r| {
             let top: Vec<(String, f32)> = serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default();
-            let model_class = classify::sounds(top)
-                .into_iter()
-                .next()
-                .filter(|(_, score)| *score >= classify::MIN_SOUND_SCORE)
-                .map(|(class, _)| class);
-            Ok(Exemplar { label: r.get(0)?, embedding: from_blob(&r.get::<_, Vec<u8>>(1)?), model_class })
+            let top_sound = classify::sounds(top).into_iter().next();
+            Ok(Exemplar { label: r.get(0)?, embedding: from_blob(&r.get::<_, Vec<u8>>(1)?), top_sound })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -334,7 +357,7 @@ mod tests {
         let exemplars = store.exemplars().unwrap();
         assert_eq!(exemplars.len(), 1);
         assert_eq!((exemplars[0].label.as_str(), exemplars[0].embedding.clone()), ("back door", vec![0.6, 0.8]));
-        assert_eq!(exemplars[0].model_class.as_deref(), Some("Door"));
+        assert_eq!(exemplars[0].top_sound, Some(("Door".into(), 0.5)));
     }
 
     #[test]
@@ -373,14 +396,31 @@ mod tests {
     }
 
     #[test]
-    fn trigger_tuning_round_trips() {
+    fn settings_round_trip() {
         let store = temp_store();
-        assert!(store.trigger_tuning().unwrap().is_none());
-        let t = Tuning { ratio: 4.0, close_ratio: 2.0, ambient_floor_db: -50.0 };
-        store.set_trigger_tuning(Some(&t)).unwrap();
-        assert_eq!(store.trigger_tuning().unwrap(), Some(t));
-        store.set_trigger_tuning(None).unwrap();
-        assert!(store.trigger_tuning().unwrap().is_none());
+        assert!(store.overrides().unwrap().is_empty());
+        assert_eq!(store.mode().unwrap(), Mode::Active);
+        let overrides = serde_json::json!({"trigger.ratio": 4.0}).as_object().unwrap().clone();
+        store.set_overrides(&overrides).unwrap();
+        store.set_mode(Mode::Deaf).unwrap();
+        assert_eq!((store.overrides().unwrap(), store.mode().unwrap()), (overrides, Mode::Deaf));
+    }
+
+    #[test]
+    fn live_view_values_from_0_1_become_overrides() {
+        let dir = std::env::temp_dir().join(format!("creak-old-trigger-{}", rand_suffix()));
+        Store::open(&dir)
+            .unwrap()
+            .set_setting(
+                OLD_TRIGGER_KEY,
+                &serde_json::json!({"ratio": 4.0, "close_ratio": 2.0, "ambient_floor_db": -50.0}),
+            )
+            .unwrap();
+        let store = Store::open(&dir).unwrap();
+        let expected =
+            serde_json::json!({"trigger.ratio": 4.0, "trigger.close_ratio": 2.0, "trigger.ambient_floor_db": -50.0});
+        assert_eq!(serde_json::Value::Object(store.overrides().unwrap()), expected);
+        assert!(store.setting::<Overrides>(OLD_TRIGGER_KEY).unwrap().is_none());
     }
 
     #[test]

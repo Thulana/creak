@@ -1,11 +1,11 @@
 //! The web UI: one embedded page and a small JSON API on the same port.
 
-use crate::config::{self, Tuning};
-use crate::daemon::SharedLive;
+use crate::config::{self, Config, Mode, Overrides};
+use crate::daemon::{SharedLive, SharedSettings};
 use crate::store::{Filter, Store};
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::Read;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
@@ -14,13 +14,14 @@ const PAGE: &str = include_str!("../ui/index.html");
 
 type Reply = Response<std::io::Cursor<Vec<u8>>>;
 
-/// `file_tuning` holds the config file's trigger values, which a reset in the Live view returns to.
-pub fn serve(config: &config::Web, file_tuning: Tuning, mut store: Store, live: SharedLive) -> Result<()> {
-    let server = Server::http(&config.listen).map_err(|e| anyhow!("listening on {}: {e}", config.listen))?;
-    eprintln!("web UI on http://{}/", config.listen);
+/// `file` is the config file as read, which resetting a setting returns to.
+pub fn serve(file: &Config, mut store: Store, live: SharedLive, settings: SharedSettings) -> Result<()> {
+    let listen = &file.web.listen;
+    let server = Server::http(listen).map_err(|e| anyhow!("listening on {listen}: {e}"))?;
+    eprintln!("web UI on http://{listen}/");
     for mut request in server.incoming_requests() {
-        let reply = handle(&mut request, &config.token, file_tuning, &mut store, &live)
-            .unwrap_or_else(|e| text(500, &format!("{e:#}")));
+        let reply =
+            handle(&mut request, file, &mut store, &live, &settings).unwrap_or_else(|e| text(500, &format!("{e:#}")));
         let _ = request.respond(reply);
     }
     Ok(())
@@ -28,10 +29,10 @@ pub fn serve(config: &config::Web, file_tuning: Tuning, mut store: Store, live: 
 
 fn handle(
     request: &mut Request,
-    token: &str,
-    file_tuning: Tuning,
+    file: &Config,
     store: &mut Store,
     live: &SharedLive,
+    settings: &SharedSettings,
 ) -> Result<Reply> {
     let url = request.url().to_string();
     let (path, query) = split_url(&url);
@@ -41,19 +42,20 @@ fn handle(
     if method == Method::Get && path == [""] {
         return Ok(with_type(Response::from_data(PAGE.as_bytes().to_vec()), "text/html; charset=utf-8"));
     }
-    if !authorized(request, &query, token) {
+    if !authorized(request, &query, &file.web.token) {
         return Ok(text(401, "missing or wrong token"));
     }
     Ok(match (method, path.as_slice()) {
         (Method::Get, ["api", "live"]) => {
             let since: u64 = query.get("since").and_then(|s| s.parse().ok()).unwrap_or(0);
+            let mode = settings.lock().unwrap().mode;
             let l = live.lock().unwrap();
             let fresh = (l.frame.saturating_sub(since) as usize).min(l.levels.len());
             json_reply(&json!({
                 "device": l.device, "device_rate": l.device_rate, "frame": l.frame,
                 "levels": l.levels.iter().skip(l.levels.len() - fresh).collect::<Vec<_>>(),
                 "ambient_db": l.ambient_db, "open_db": l.open_db, "close_db": l.close_db, "recording": l.recording, "error": l.error,
-                "measured_ambient_db": l.measured_ambient_db, "tuning": l.tuning, "tuned": l.tuned,
+                "measured_ambient_db": l.measured_ambient_db, "mode": mode,
             }))
         }
         (Method::Get, ["api", "events"]) => {
@@ -70,19 +72,39 @@ fn handle(
         (Method::Get, ["api", "labels"]) => {
             json_reply(&json!({ "labels": store.labels()?, "pending": store.pending_count()? }))
         }
-        (Method::Post, ["api", "trigger"]) => {
-            let Ok(tuning) = serde_json::from_str::<Tuning>(&read_body(request)?) else {
-                return Ok(text(400, "expected {\"ratio\", \"close_ratio\", \"ambient_floor_db\"}"));
+        (Method::Get, ["api", "settings"]) => settings_reply(file, settings)?,
+        (Method::Patch, ["api", "settings"]) => {
+            let Ok(patch) = serde_json::from_str::<Overrides>(&read_body(request)?) else {
+                return Ok(text(400, "expected {\"section.name\": value, …}; null resets a setting"));
             };
-            if let Err(e) = config::Trigger::default().with_tuning(tuning).validate() {
-                return Ok(text(400, &e.to_string()));
+            let mut overrides = settings.lock().unwrap().overrides.clone();
+            for (key, value) in patch {
+                if value.is_null() {
+                    overrides.remove(&key);
+                } else {
+                    overrides.insert(key, value);
+                }
             }
-            store.set_trigger_tuning(Some(&tuning))?;
-            retune(live, tuning, true)
+            override_settings(file, store, settings, overrides)?
         }
-        (Method::Delete, ["api", "trigger"]) => {
-            store.set_trigger_tuning(None)?;
-            retune(live, file_tuning, false)
+        (Method::Delete, ["api", "settings"]) => override_settings(file, store, settings, Overrides::new())?,
+        (Method::Get, ["api", "mode"]) => json_reply(&json!({ "mode": settings.lock().unwrap().mode })),
+        (Method::Post, ["api", "mode"]) => {
+            #[derive(Deserialize)]
+            struct Body {
+                mode: Mode,
+            }
+            let Ok(Body { mode }) = serde_json::from_str(&read_body(request)?) else {
+                return Ok(text(400, "expected {\"mode\": \"active\"} or {\"mode\": \"deaf\"}"));
+            };
+            store.set_mode(mode)?;
+            let mut s = settings.lock().unwrap();
+            if s.mode != mode {
+                eprintln!("mode: {}", if mode == Mode::Deaf { "deaf, not recording" } else { "active" });
+            }
+            s.mode = mode;
+            s.version += 1;
+            json_reply(&json!({ "mode": mode }))
         }
         (Method::Post, ["api", "events", id, "label"]) => {
             #[derive(Deserialize)]
@@ -114,10 +136,41 @@ fn handle(
     })
 }
 
-fn retune(live: &SharedLive, tuning: Tuning, tuned: bool) -> Reply {
-    let mut l = live.lock().unwrap();
-    (l.tuning, l.tuned, l.retune) = (tuning, tuned, true);
-    json_reply(&json!({ "tuning": l.tuning, "tuned": l.tuned }))
+/// Applies `overrides` to the config file, and stores them only if the result is valid.
+fn override_settings(file: &Config, store: &Store, settings: &SharedSettings, overrides: Overrides) -> Result<Reply> {
+    let config = match file.with_overrides(&overrides) {
+        Ok(config) => config,
+        Err(e) => return Ok(text(400, &format!("{e:#}"))),
+    };
+    store.set_overrides(&overrides)?;
+    {
+        let mut s = settings.lock().unwrap();
+        (s.config, s.overrides) = (config, overrides);
+        s.version += 1;
+    }
+    settings_reply(file, settings)
+}
+
+/// Every live setting with its range, help, value in effect and config-file value, plus the
+/// settings that only the config file can change.
+fn settings_reply(file: &Config, settings: &SharedSettings) -> Result<Reply> {
+    let s = settings.lock().unwrap();
+    // Through a string, so f32 values read as written (0.85) rather than widened (0.8500000238).
+    let as_written = |c: &Config| serde_json::from_str::<Value>(&serde_json::to_string(c)?);
+    let (file_values, values) = (as_written(file)?, as_written(&s.config)?);
+    let mut fields = Vec::new();
+    for f in config::FIELDS {
+        let mut field = serde_json::to_value(f)?;
+        field["value"] = config::lookup(&values, f.key).cloned().unwrap_or(Value::Null);
+        field["file"] = config::lookup(&file_values, f.key).cloned().unwrap_or(Value::Null);
+        field["overridden"] = s.overrides.contains_key(f.key).into();
+        fields.push(field);
+    }
+    Ok(json_reply(&json!({
+        "fields": fields,
+        "mode": s.mode,
+        "file_only": { "audio.device": file.audio.device, "storage.dir": file.storage.dir, "web.listen": file.web.listen },
+    })))
 }
 
 fn read_body(request: &mut Request) -> Result<String> {
