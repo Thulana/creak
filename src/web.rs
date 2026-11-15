@@ -62,6 +62,7 @@ fn handle(
                 label: query.get("label").filter(|s| !s.is_empty()).cloned(),
                 since_ms: None,
                 before_id: query.get("before").and_then(|s| s.parse().ok()),
+                hide_ignored: query.get("hide_ignored").is_some_and(|v| v == "1"),
                 limit: query.get("limit").and_then(|s| s.parse().ok()).unwrap_or(50).clamp(1, 500),
             };
             json_reply(&json!({ "events": store.events(&filter)? }))

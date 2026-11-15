@@ -78,6 +78,7 @@ pub struct Filter {
     pub label: Option<String>,
     pub since_ms: Option<i64>,
     pub before_id: Option<i64>,
+    pub hide_ignored: bool,
     pub limit: i64,
 }
 
@@ -173,9 +174,11 @@ impl Store {
             "{SELECT_EVENT}
              WHERE (?1 IS NULL OR e.status = ?1) AND (?2 IS NULL OR e.label = ?2)
                AND (?3 IS NULL OR e.ts >= ?3) AND (?4 IS NULL OR e.id < ?4)
+               AND (NOT ?6 OR e.status <> 'ignored')
              ORDER BY e.id DESC LIMIT ?5"
         ))?;
-        let rows = stmt.query_map(params![f.status, f.label, f.since_ms, f.before_id, f.limit], event_from_row)?;
+        let rows = stmt
+            .query_map(params![f.status, f.label, f.since_ms, f.before_id, f.limit, f.hide_ignored], event_from_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 

@@ -4,6 +4,8 @@ use serde::Serialize;
 
 /// Reserved label: clips that match it are logged without keeping the audio.
 pub const IGNORE: &str = "ignore";
+/// The model's class for "nothing here". A clip it hears as silence is not worth a question.
+pub const SILENCE_CLASS: &str = "Silence";
 
 pub struct Exemplar {
     pub label: String,
@@ -44,6 +46,7 @@ pub fn decide(
     let (status, label) = match nearest {
         Some((e, sim)) if sim >= match_threshold && e.label == IGNORE => (Status::Ignored, IGNORE.to_string()),
         Some((e, sim)) if sim >= match_threshold => (Status::Match, e.label.clone()),
+        _ if model_guess == SILENCE_CLASS => (Status::Ignored, "silence".to_string()),
         Some((e, sim)) if sim >= suggest_threshold => (Status::Pending, e.label.clone()),
         _ => (Status::Pending, normalize_label(model_guess).unwrap_or_default()),
     };
@@ -99,6 +102,14 @@ mod tests {
     fn ignore_match_is_ignored() {
         let d = run([1.0, 0.0], &[ex(IGNORE, [1.0, 0.0])]);
         assert_eq!(d.status, Status::Ignored);
+    }
+
+    #[test]
+    fn model_silence_is_ignored_unless_taught_otherwise() {
+        let d = decide(&[1.0, 0.0], &[ex("bell", [0.7, 0.714])], SILENCE_CLASS, 0.8, 0.6);
+        assert_eq!((d.status, d.label.as_str()), (Status::Ignored, "silence"));
+        let d = decide(&[1.0, 0.0], &[ex("tick", [1.0, 0.0])], SILENCE_CLASS, 0.8, 0.6);
+        assert_eq!((d.status, d.label.as_str()), (Status::Match, "tick"));
     }
 
     #[test]

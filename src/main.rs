@@ -65,7 +65,14 @@ fn main() -> Result<()> {
         Command::Events { since, label, status, limit, json } => {
             let store = open_store(&cli.config)?;
             let since_ms = since.map(|s| parse_age(&s).map(|ms| store::now_ms() - ms)).transpose()?;
-            let events = store.events(&store::Filter { status, label, since_ms, before_id: None, limit })?;
+            let events = store.events(&store::Filter {
+                status,
+                label,
+                since_ms,
+                before_id: None,
+                hide_ignored: false,
+                limit,
+            })?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&events)?);
             } else {
