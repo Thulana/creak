@@ -42,7 +42,30 @@ fn find_device(name: &str) -> Result<Device> {
 }
 
 pub fn open(device_name: &str) -> Result<Input> {
-    let device = find_device(device_name)?;
+    let error = match open_device(find_device(device_name)?, device_name) {
+        Ok(input) => return Ok(input),
+        Err(e) if device_name != "default" => return Err(e),
+        Err(e) => e,
+    };
+    // Without a sound server, ALSA's default capture device is card 0 shared through dsnoop. It
+    // fails while the card itself would open when card 0 has no input (an HDMI card), or when
+    // /dev/snd/timer is missing, as in a container given only the card's own nodes. A plughw
+    // device opens the card directly and converts the format and rate.
+    let cards = cpal::default_host()
+        .input_devices()
+        .into_iter()
+        .flatten()
+        .filter(|d| d.id().is_ok_and(|id| id.id().starts_with("plughw:")));
+    for device in cards {
+        if let Ok(input) = open_device(device, device_name) {
+            eprintln!("audio: the default device failed ({error:#}); using {}", input.name);
+            return Ok(input);
+        }
+    }
+    Err(error)
+}
+
+fn open_device(device: Device, device_name: &str) -> Result<Input> {
     let name = device.id().map(|id| id.to_string()).unwrap_or_else(|_| device_name.to_string());
     // Prefer a native 16 kHz config so no resampling is needed.
     let config = device

@@ -53,7 +53,7 @@ Label the sound that triggered the clip, not what was playing in the background:
 
 ```toml
 [audio]
-device = "default"        # or an id from `creak devices`
+device = "default"        # ALSA's default, else the first card that can record; or an id from `creak devices`
 
 [trigger]
 ratio = 3.0               # open when louder than ambient × ratio (about +9.5 dB)
@@ -98,7 +98,7 @@ The database belongs to the `creak` user, so run `events` and `label` as `sudo -
 
 ## Running in a container
 
-The microphone belongs to the host. Pass the capture devices under `/dev/snd` into the container and make sure the container's `audio` group can open them. In an unprivileged LXC container, enable nesting, or the hardened systemd unit fails to start with `226/NAMESPACE`.
+The microphone belongs to the host. Pass the card's control node and its capture nodes from `/dev/snd` into the container (for card 1, device 0: `controlC1` and `pcmC1D0c`) and make sure the container's `audio` group can open them. ALSA's `default` device also needs `/dev/snd/timer`; without it, creak opens the first card that can record directly and logs which one it chose. In an unprivileged LXC container, enable nesting, or the hardened systemd unit fails to start with `226/NAMESPACE`.
 
 ## Building
 
