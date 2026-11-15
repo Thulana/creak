@@ -20,6 +20,7 @@ const RING_SAMPLES: usize = SAMPLE_RATE as usize * 2;
 const ONSET_MARGIN_SAMPLES: usize = SAMPLE_RATE as usize / 10;
 const LIVE_FRAMES: usize = 30 * 1000 / trigger::FRAME_MS as usize;
 const STALL: Duration = Duration::from_secs(10);
+const RETRY: Duration = Duration::from_secs(10);
 const EXPIRE_EVERY: Duration = Duration::from_secs(3600);
 
 /// What the Live view shows: recent frame levels and the current trigger lines.
@@ -34,6 +35,8 @@ pub struct Live {
     pub open_db: f32,
     pub close_db: f32,
     pub recording: bool,
+    /// The last capture error while the device is being retried.
+    pub error: Option<String>,
 }
 
 pub type SharedLive = Arc<Mutex<Live>>;
@@ -66,19 +69,26 @@ pub fn run(config: Config) -> Result<()> {
 
     let (clips_tx, clips_rx) = channel();
     let classify_config = config.clone();
-    let classifier = std::thread::spawn(move || classify_loop(&classify_config, store, tagger, clips_rx));
+    std::thread::spawn(move || classify_loop(&classify_config, store, tagger, clips_rx));
 
-    let input = capture::open(&config.audio.device)?;
-    eprintln!("capturing from {} at {} Hz", input.name, input.rate);
-    {
-        let mut l = live.lock().unwrap();
-        l.device = input.name.clone();
-        l.device_rate = input.rate;
+    // A missing or failing microphone is retried rather than fatal, so the web UI stays up
+    // and shows what is wrong.
+    loop {
+        let error = match capture::open(&config.audio.device) {
+            Ok(input) => {
+                eprintln!("capturing from {} at {} Hz", input.name, input.rate);
+                {
+                    let mut l = live.lock().unwrap();
+                    (l.device, l.device_rate, l.error) = (input.name.clone(), input.rate, None);
+                }
+                capture_loop(&config, &input.chunks, input.rate, &live, &clips_tx).unwrap_err()
+            }
+            Err(e) => e,
+        };
+        eprintln!("audio: {error:#}; retrying in {}s", RETRY.as_secs());
+        live.lock().unwrap().error = Some(format!("{error:#}"));
+        std::thread::sleep(RETRY);
     }
-    let result = capture_loop(&config, &input.chunks, input.rate, &live, &clips_tx);
-    drop(clips_tx);
-    let _ = classifier.join();
-    result
 }
 
 fn capture_loop(

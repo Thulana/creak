@@ -89,6 +89,7 @@
   </section>
 
   <section id="view-live" hidden>
+    <div class="err" id="live-error" hidden></div>
     <div class="stats">
       <div class="stat"><b id="l-level">–</b><span>level dBFS</span></div>
       <div class="stat"><b id="l-ambient">–</b><span>ambient dBFS</span></div>
@@ -173,7 +174,7 @@ async function loadReview() {
 }
 function renderReview() {
   const list = $('review-list');
-  if (!queue.length) { list.innerHTML = '<div class="card"><b>Nothing to review.</b><p class="hint">New sounds appear here as they are heard.</p></div>'; return; }
+  if (!queue.length) { list.innerHTML = '<div class="card"><b>Nothing to review.</b><p class="hint">New sounds appear here as they are heard. The Live view shows whether the microphone is picking anything up.</p></div>'; return; }
   list.innerHTML = queue.map((e, i) => `
     <div class="card ${i === cursor ? 'current' : ''}" data-i="${i}">
       <div class="row">
@@ -285,7 +286,9 @@ async function pollLive() {
     $('l-level').textContent = fmtDb(last);
     $('l-ambient').textContent = fmtDb(live.ambient_db);
     $('l-open').textContent = fmtDb(live.open_db);
-    $('l-state').innerHTML = live.recording ? '<span class="rec">● recording</span>' : 'listening';
+    $('l-state').innerHTML = live.error ? '<span class="rec">no audio</span>' : live.recording ? '<span class="rec">● recording</span>' : 'listening';
+    $('live-error').hidden = !live.error;
+    $('live-error').textContent = live.error ? 'Microphone problem (retrying every 10 s): ' + live.error : '';
     $('l-device').textContent = live.device ? `${live.device} @ ${live.device_rate} Hz` : 'no audio yet';
     draw();
   } catch (_) {}

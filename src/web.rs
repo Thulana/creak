@@ -45,7 +45,7 @@ fn handle(request: &mut Request, token: &str, store: &mut Store, live: &SharedLi
             json_reply(&json!({
                 "device": l.device, "device_rate": l.device_rate, "frame": l.frame,
                 "levels": l.levels.iter().skip(l.levels.len() - fresh).collect::<Vec<_>>(),
-                "ambient_db": l.ambient_db, "open_db": l.open_db, "close_db": l.close_db, "recording": l.recording,
+                "ambient_db": l.ambient_db, "open_db": l.open_db, "close_db": l.close_db, "recording": l.recording, "error": l.error,
             }))
         }
         (Method::Get, ["api", "events"]) => {
