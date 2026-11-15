@@ -53,33 +53,51 @@ pub struct Trigger {
 
 impl Trigger {
     pub fn new(c: &config::Trigger) -> Self {
-        let frames = |ms: u32| ms.div_ceil(FRAME_MS).max(1);
-        Self {
-            open_over_db: 20.0 * c.ratio.log10(),
-            close_over_db: 20.0 * c.close_ratio.log10(),
-            min_frames: frames(c.min_ms),
-            hang_frames: frames(c.hang_ms),
-            max_frames: frames(c.max_clip_s * 1000) as u64,
-            cooldown_frames: (c.cooldown_s * 1000 / FRAME_MS) as u64,
-            floor_db: c.ambient_floor_db,
+        let mut trigger = Self {
+            open_over_db: 0.0,
+            close_over_db: 0.0,
+            min_frames: 0,
+            hang_frames: 0,
+            max_frames: 0,
+            cooldown_frames: 0,
+            floor_db: 0.0,
             history: VecDeque::with_capacity(AMBIENT_WINDOW_FRAMES),
             histogram: vec![0; BINS],
             frame: 0,
             state: State::Idle { above: 0 },
-        }
+        };
+        trigger.retune(c);
+        trigger
     }
 
-    /// Ambient level in dBFS: the 10th percentile of the trailing 5 minutes, never below the floor.
-    pub fn ambient_db(&self) -> f32 {
+    /// Applies new settings without losing the ambient history or an open clip.
+    pub fn retune(&mut self, c: &config::Trigger) {
+        let frames = |ms: u32| ms.div_ceil(FRAME_MS).max(1);
+        self.open_over_db = 20.0 * c.ratio.log10();
+        self.close_over_db = 20.0 * c.close_ratio.log10();
+        self.min_frames = frames(c.min_ms);
+        self.hang_frames = frames(c.hang_ms);
+        self.max_frames = frames(c.max_clip_s * 1000) as u64;
+        self.cooldown_frames = (c.cooldown_s * 1000 / FRAME_MS) as u64;
+        self.floor_db = c.ambient_floor_db;
+    }
+
+    /// The 10th percentile of the trailing 5 minutes, before the floor is applied.
+    pub fn measured_ambient_db(&self) -> Option<f32> {
         let target = (self.history.len() as f32 * AMBIENT_PERCENTILE).ceil().max(1.0) as u32;
         let mut seen = 0;
         for (bin, &count) in self.histogram.iter().enumerate() {
             seen += count;
             if seen >= target {
-                return (MIN_DB + bin as f32 * BIN_DB).max(self.floor_db);
+                return Some(MIN_DB + bin as f32 * BIN_DB);
             }
         }
-        self.floor_db
+        None
+    }
+
+    /// Ambient level in dBFS that the thresholds are relative to: the measured one, never below the floor.
+    pub fn ambient_db(&self) -> f32 {
+        self.measured_ambient_db().map_or(self.floor_db, |m| m.max(self.floor_db))
     }
 
     /// (open, close) thresholds in dBFS at the current ambient.
@@ -166,6 +184,16 @@ mod tests {
         let mut quiet = trigger();
         feed(&mut quiet, -90.0, 500);
         assert_eq!(quiet.ambient_db(), -60.0);
+    }
+
+    #[test]
+    fn retune_moves_the_line_and_keeps_history() {
+        let mut t = trigger();
+        feed(&mut t, -50.0, WARMUP_FRAMES);
+        t.retune(&config::Trigger { ratio: 10.0, ..Default::default() });
+        assert_eq!(t.thresholds_db().0, -30.0);
+        assert!(feed(&mut t, -35.0, 10).is_empty());
+        assert!(matches!(feed(&mut t, -25.0, 3)[..], [Event::Open { .. }]));
     }
 
     #[test]

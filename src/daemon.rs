@@ -2,7 +2,7 @@
 
 use crate::capture::{self, Resampler};
 use crate::classify;
-use crate::config::Config;
+use crate::config::{Config, Tuning};
 use crate::embed::{self, Tagger};
 use crate::store::{NewEvent, Store, now_ms};
 use crate::trigger::{self, Event, FRAME, SAMPLE_RATE, Trigger};
@@ -37,6 +37,14 @@ pub struct Live {
     pub recording: bool,
     /// The last capture error while the device is being retried.
     pub error: Option<String>,
+    /// The 10th-percentile room level before the floor is applied.
+    pub measured_ambient_db: Option<f32>,
+    /// Trigger values in effect, and whether they come from the Live view rather than the config file.
+    pub tuning: Tuning,
+    pub tuned: bool,
+    /// Set by the web UI after changing `tuning`; the capture loop applies it.
+    #[serde(skip)]
+    pub retune: bool,
 }
 
 pub type SharedLive = Arc<Mutex<Live>>;
@@ -55,12 +63,21 @@ pub fn run(config: Config) -> Result<()> {
     let tagger = Tagger::load()?;
     eprintln!("model loaded; storage at {}", config.storage.dir.display());
     let live = SharedLive::default();
+    let file_tuning = config.trigger.tuning();
+    {
+        let mut l = live.lock().unwrap();
+        l.tuning = file_tuning;
+        if let Some(t) = store.trigger_tuning()?.filter(|t| config.trigger.with_tuning(*t).validate().is_ok()) {
+            eprintln!("using trigger values set in the web UI: {t:?}");
+            (l.tuning, l.tuned) = (t, true);
+        }
+    }
 
     if config.web.enabled {
         let web_store = Store::open(&config.storage.dir)?;
         let (web, live) = (config.web.clone(), live.clone());
         std::thread::spawn(move || {
-            if let Err(e) = crate::web::serve(&web, web_store, live) {
+            if let Err(e) = crate::web::serve(&web, file_tuning, web_store, live) {
                 eprintln!("web UI stopped: {e:#}");
                 std::process::exit(1);
             }
@@ -99,7 +116,7 @@ fn capture_loop(
     clips: &Sender<Clip>,
 ) -> Result<()> {
     let mut resampler = Resampler::new(rate);
-    let mut trigger = Trigger::new(&config.trigger);
+    let mut trigger = Trigger::new(&config.trigger.with_tuning(live.lock().unwrap().tuning));
     let mut ring: VecDeque<f32> = VecDeque::with_capacity(RING_SAMPLES);
     let mut pending: Vec<f32> = Vec::new();
     let mut resampled = Vec::new();
@@ -153,14 +170,19 @@ fn capture_loop(
             }
             frame_index += 1;
 
-            let (open_db, close_db) = trigger.thresholds_db();
             let mut l = live.lock().unwrap();
+            if l.retune {
+                trigger.retune(&config.trigger.with_tuning(l.tuning));
+                l.retune = false;
+            }
+            let (open_db, close_db) = trigger.thresholds_db();
             if l.levels.len() == LIVE_FRAMES {
                 l.levels.pop_front();
             }
             l.levels.push_back(level);
             l.frame = frame_index;
             l.ambient_db = trigger.ambient_db();
+            l.measured_ambient_db = trigger.measured_ambient_db();
             (l.open_db, l.close_db) = (open_db, close_db);
             l.recording = trigger.is_open();
         }
@@ -170,6 +192,7 @@ fn capture_loop(
 
 fn classify_loop(config: &Config, store: Store, tagger: Tagger, clips: Receiver<Clip>) {
     let mut last_expiry: Option<Instant> = None;
+    let mut last: Option<Latest> = None;
     loop {
         if last_expiry.is_none_or(|t| t.elapsed() >= EXPIRE_EVERY) {
             match store.expire(config.storage.retention_days) {
@@ -181,7 +204,7 @@ fn classify_loop(config: &Config, store: Store, tagger: Tagger, clips: Receiver<
         }
         match clips.recv_timeout(Duration::from_secs(60)) {
             Ok(clip) => {
-                if let Err(e) = handle_clip(config, &store, &tagger, &clip) {
+                if let Err(e) = handle_clip(config, &store, &tagger, &clip, &mut last) {
                     eprintln!("clip at {}: {e:#}", clip.ts);
                 }
             }
@@ -199,13 +222,35 @@ pub fn analysis_window(clip: &Clip) -> &[f32] {
     &clip.samples[start..]
 }
 
-fn handle_clip(config: &Config, store: &Store, tagger: &Tagger, clip: &Clip) -> Result<()> {
+/// The most recent event and when it ended, for grouping the next clip into it.
+#[derive(Clone, Copy)]
+struct Latest {
+    id: i64,
+    end_ts: i64,
+}
+
+fn handle_clip(config: &Config, store: &Store, tagger: &Tagger, clip: &Clip, last: &mut Option<Latest>) -> Result<()> {
     let started = Instant::now();
     let tags = tagger.tag(analysis_window(clip))?;
     let top = tagger.top_classes(&tags.scores, 3);
     let c = &config.classify;
     let decision =
         classify::decide(&tags.embedding, &store.exemplars()?, &top[0].0, c.match_threshold, c.suggest_threshold);
+    let ms = |samples: usize| samples as i64 * 1000 / SAMPLE_RATE as i64;
+    let (onset_ts, end_ts) = (clip.ts + ms(clip.onset), clip.ts + ms(clip.samples.len()));
+
+    if decision.status == classify::Status::Ignored {
+        *last = None;
+    } else if let Some(prev) = *last
+        && c.group_gap_s > 0
+        && onset_ts - prev.end_ts <= c.group_gap_s as i64 * 1000
+        && store.event(prev.id)?.is_some_and(|e| e.label == decision.label)
+    {
+        store.extend_event(prev.id, end_ts, clip.peak_db, decision.status == classify::Status::Match)?;
+        *last = Some(Latest { id: prev.id, end_ts });
+        eprintln!("event {}: extended with another {:?} clip", prev.id, decision.label);
+        return Ok(());
+    }
 
     let clip_path = if decision.status == classify::Status::Ignored {
         None
@@ -217,7 +262,7 @@ fn handle_clip(config: &Config, store: &Store, tagger: &Tagger, clip: &Clip) -> 
     };
     let id = store.insert_event(&NewEvent {
         ts: clip.ts,
-        duration_ms: clip.samples.len() as i64 * 1000 / SAMPLE_RATE as i64,
+        duration_ms: end_ts - clip.ts,
         peak_db: clip.peak_db,
         ambient_db: clip.ambient_db,
         decision: &decision,
@@ -225,6 +270,9 @@ fn handle_clip(config: &Config, store: &Store, tagger: &Tagger, clip: &Clip) -> 
         clip_path: clip_path.as_deref(),
         embedding: &tags.embedding,
     })?;
+    if decision.status != classify::Status::Ignored {
+        *last = Some(Latest { id, end_ts });
+    }
     let nearest = decision.nearest.map(|(l, s)| format!(", nearest {l} {s:.2}")).unwrap_or_default();
     eprintln!(
         "event {id}: {:?} {:?} ({}{nearest}) in {} ms",
@@ -272,6 +320,29 @@ mod tests {
         assert_eq!(analysis_window(&c).len(), embed::MIN_SAMPLES);
     }
 
+    #[test]
+    fn back_to_back_clips_with_the_same_label_are_grouped() {
+        let dir = std::env::temp_dir().join(format!("creak-group-{}", std::process::id()));
+        let mut config = Config::default();
+        config.storage.dir = dir.clone();
+        let store = Store::open(&dir).unwrap();
+        let tagger = Tagger::load().unwrap();
+        let sound: Vec<f32> = hound::WavReader::open(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synth.wav"))
+            .unwrap()
+            .samples::<i16>()
+            .map(|s| s.unwrap() as f32 / 32768.0)
+            .collect();
+        let at = |ts: i64| Clip { samples: sound.clone(), onset: 0, ts, peak_db: -20.0, ambient_db: -60.0 };
+        let mut last = None;
+        // 2.5 s clips: the second starts 2 s after the first ends, the third 60 s later.
+        for ts in [0, 4_500, 67_000] {
+            handle_clip(&config, &store, &tagger, &at(1_000_000 + ts), &mut last).unwrap();
+        }
+        let events = store.events(&crate::store::Filter { limit: 10, ..Default::default() }).unwrap();
+        assert_eq!(events.iter().map(|e| (e.parts, e.duration_ms)).collect::<Vec<_>>(), vec![(1, 2_500), (2, 7_000)]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Quiet noise, then the fixture sound, then quiet again: one clip, tagged and stored as
     /// pending; after labelling it, the same sound is a match.
     #[test]
@@ -312,13 +383,13 @@ mod tests {
 
         let mut store = Store::open(&dir).unwrap();
         let tagger = Tagger::load().unwrap();
-        handle_clip(&config, &store, &tagger, &clips[0]).unwrap();
+        handle_clip(&config, &store, &tagger, &clips[0], &mut None).unwrap();
         let first = &store.events(&crate::store::Filter { limit: 1, ..Default::default() }).unwrap()[0];
         assert_eq!(first.status, "pending");
         assert!(dir.join(first.clip_path.as_ref().unwrap()).exists());
 
         store.label_event(first.id, "chirp").unwrap();
-        handle_clip(&config, &store, &tagger, &feed(audio).remove(0)).unwrap();
+        handle_clip(&config, &store, &tagger, &feed(audio).remove(0), &mut None).unwrap();
         let second = &store.events(&crate::store::Filter { limit: 1, ..Default::default() }).unwrap()[0];
         assert_eq!((second.status.as_str(), second.label.as_str()), ("match", "chirp"));
         let _ = std::fs::remove_dir_all(dir);

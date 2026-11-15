@@ -1,6 +1,7 @@
 //! SQLite event log, exemplars and clip files under the storage directory.
 
 use crate::classify::{self, Exemplar};
+use crate::config::Tuning;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
@@ -19,7 +20,8 @@ CREATE TABLE IF NOT EXISTS events (
     nearest_label TEXT,
     top_classes   TEXT    NOT NULL,   -- JSON [[class, score], ...] from the model
     clip_path     TEXT,               -- relative to the storage dir; NULL once dropped
-    embedding     BLOB    NOT NULL    -- empty once the clip has expired
+    embedding     BLOB    NOT NULL,   -- empty once the clip has expired
+    parts         INTEGER NOT NULL DEFAULT 1  -- clips grouped into this event; only the first is kept
 );
 CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
 CREATE TABLE IF NOT EXISTS exemplars (
@@ -29,7 +31,13 @@ CREATE TABLE IF NOT EXISTS exemplars (
     embedding  BLOB    NOT NULL,
     created_ts INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL               -- JSON
+);
 ";
+
+const TRIGGER_KEY: &str = "trigger";
 
 pub struct Store {
     conn: Connection,
@@ -61,6 +69,7 @@ pub struct Event {
     pub top_classes: serde_json::Value,
     pub clip_path: Option<String>,
     pub exemplar: bool,
+    pub parts: i64,
 }
 
 #[derive(Default)]
@@ -86,6 +95,11 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+        let has_parts: bool =
+            conn.query_row("SELECT COUNT(*) FROM pragma_table_info('events') WHERE name = 'parts'", [], |r| r.get(0))?;
+        if !has_parts {
+            conn.execute_batch("ALTER TABLE events ADD COLUMN parts INTEGER NOT NULL DEFAULT 1")?;
+        }
         Ok(Self { conn, dir: dir.to_path_buf() })
     }
 
@@ -114,6 +128,37 @@ impl Store {
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Grows an event by one more clip that ends at `end_ts`. A pending event becomes a match
+    /// when the new clip matched an exemplar with the same label.
+    pub fn extend_event(&self, id: i64, end_ts: i64, peak_db: f32, matched: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE events SET duration_ms = ?2 - ts, peak_db = max(peak_db, ?3), parts = parts + 1,
+                    status = CASE WHEN ?4 AND status = 'pending' THEN 'match' ELSE status END
+             WHERE id = ?1",
+            params![id, end_ts, peak_db, matched],
+        )?;
+        Ok(())
+    }
+
+    pub fn trigger_tuning(&self) -> Result<Option<Tuning>> {
+        let value: Option<String> =
+            self.conn.query_row("SELECT value FROM settings WHERE key = ?1", [TRIGGER_KEY], |r| r.get(0)).optional()?;
+        Ok(value.and_then(|v| serde_json::from_str(&v).ok()))
+    }
+
+    /// Stores trigger values changed in the Live view; `None` goes back to the config file.
+    pub fn set_trigger_tuning(&self, tuning: Option<&Tuning>) -> Result<()> {
+        match tuning {
+            Some(t) => self.conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![TRIGGER_KEY, serde_json::to_string(t)?],
+            )?,
+            None => self.conn.execute("DELETE FROM settings WHERE key = ?1", [TRIGGER_KEY])?,
+        };
+        Ok(())
     }
 
     pub fn exemplars(&self) -> Result<Vec<Exemplar>> {
@@ -192,7 +237,7 @@ impl Store {
 
 const SELECT_EVENT: &str = "
     SELECT e.id, e.ts, e.duration_ms, e.peak_db, e.ambient_db, e.label, e.status, e.similarity,
-           e.nearest_label, e.top_classes, e.clip_path, x.id IS NOT NULL
+           e.nearest_label, e.top_classes, e.clip_path, x.id IS NOT NULL, e.parts
     FROM events e LEFT JOIN exemplars x ON x.event_id = e.id";
 
 fn event_from_row(r: &Row) -> rusqlite::Result<Event> {
@@ -209,6 +254,7 @@ fn event_from_row(r: &Row) -> rusqlite::Result<Event> {
         top_classes: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default(),
         clip_path: r.get(10)?,
         exemplar: r.get(11)?,
+        parts: r.get(12)?,
     })
 }
 
@@ -280,6 +326,42 @@ mod tests {
         assert!(store.label_event(dropped, "door").is_err());
         assert!(store.event(recent).unwrap().unwrap().clip_path.is_some());
         assert!(store.event(kept).unwrap().unwrap().clip_path.is_some());
+    }
+
+    #[test]
+    fn extending_grows_duration_and_upgrades_pending() {
+        let store = temp_store();
+        let id = insert(&store, 1_000, "music", &[1.0]);
+        store.extend_event(id, 31_000, -10.0, false).unwrap();
+        let e = store.event(id).unwrap().unwrap();
+        assert_eq!((e.duration_ms, e.parts, e.peak_db, e.status.as_str()), (30_000, 2, -10.0, "pending"));
+        store.extend_event(id, 41_000, -30.0, true).unwrap();
+        let e = store.event(id).unwrap().unwrap();
+        assert_eq!((e.duration_ms, e.parts, e.peak_db, e.status.as_str()), (40_000, 3, -10.0, "match"));
+    }
+
+    #[test]
+    fn trigger_tuning_round_trips() {
+        let store = temp_store();
+        assert!(store.trigger_tuning().unwrap().is_none());
+        let t = Tuning { ratio: 4.0, close_ratio: 2.0, ambient_floor_db: -50.0 };
+        store.set_trigger_tuning(Some(&t)).unwrap();
+        assert_eq!(store.trigger_tuning().unwrap(), Some(t));
+        store.set_trigger_tuning(None).unwrap();
+        assert!(store.trigger_tuning().unwrap().is_none());
+    }
+
+    #[test]
+    fn old_databases_gain_the_parts_column() {
+        let dir = std::env::temp_dir().join(format!("creak-migrate-{}", rand_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Connection::open(dir.join("creak.db"))
+            .unwrap()
+            .execute_batch("CREATE TABLE events (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, duration_ms INTEGER NOT NULL, peak_db REAL NOT NULL, ambient_db REAL NOT NULL, label TEXT NOT NULL, status TEXT NOT NULL, similarity REAL, nearest_label TEXT, top_classes TEXT NOT NULL, clip_path TEXT, embedding BLOB NOT NULL)")
+            .unwrap();
+        let store = Store::open(&dir).unwrap();
+        let id = insert(&store, 1_000, "door", &[1.0]);
+        assert_eq!(store.event(id).unwrap().unwrap().parts, 1);
     }
 
     #[test]

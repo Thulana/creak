@@ -35,7 +35,7 @@ Open that link from any device on your network. The token is stored in `/etc/cre
 
 ## Using it
 
-- **Live** shows the microphone level, the ambient level and the line a sound has to cross. Check it first: if the level does not move when you talk, the wrong device is selected (`creak devices`, then `[audio] device` in the config).
+- **Live** shows the microphone level, the ambient level and the line a sound has to cross. Check it first: if the level does not move when you talk, the wrong device is selected (`creak devices`, then `[audio] device` in the config). The sliders below the graph move the open line, the close line and the ambient floor while you watch; they are saved and override the config file until you press Reset.
 - **Review** lists clips waiting for an answer, each with the model's guess as a question ("Door?"). Play it, then confirm (`Y`), type the right label and correct (`C`), or ignore (`I`). Space plays, `J`/`K` move.
 - **Events** is the full log, with the nearest learned sound and its similarity for every clip. A wrong match can be relabelled here.
 
@@ -61,6 +61,7 @@ ambient_floor_db = -60    # ambient is the 10th percentile of the last 5 minutes
 [classify]
 match_threshold = 0.80    # cosine similarity to a confirmed clip that applies its label
 suggest_threshold = 0.60  # above this, the nearest label is proposed instead of the model's guess
+group_gap_s = 10          # a same-label clip within this many seconds extends the previous event; 0 = off
 
 [storage]
 dir = "/var/lib/creak"

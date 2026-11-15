@@ -45,6 +45,11 @@
   .play { width: 30px; height: 30px; border-radius: 50%; border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; flex: none; }
   .play:disabled { opacity: .35; cursor: default; }
   .filters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+  .tune { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-top: 12px; display: grid; gap: 10px; }
+  .tune label { display: grid; grid-template-columns: 150px 1fr 120px; align-items: center; gap: 10px; font-size: 14px; }
+  .tune input[type=range] { width: 100%; accent-color: var(--accent); }
+  .tune output { font-variant-numeric: tabular-nums; text-align: right; }
+  @media (max-width: 640px) { .tune label { grid-template-columns: 1fr 90px; } .tune label input { grid-column: 1 / -1; grid-row: 2; } }
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 12px; }
   .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
   .stat b { display: block; font-size: 22px; font-variant-numeric: tabular-nums; }
@@ -82,7 +87,7 @@
       <select id="f-label"><option value="">all labels</option></select>
     </div>
     <table>
-      <thead><tr><th></th><th>When</th><th>Status</th><th>Label</th><th class="wide-only">Nearest</th><th class="wide-only">Model</th><th class="wide-only">Peak / ambient</th><th></th></tr></thead>
+      <thead><tr><th></th><th>When</th><th>Status</th><th>Label</th><th class="wide-only">Nearest</th><th class="wide-only">Model</th><th class="wide-only">Length</th><th class="wide-only">Peak / ambient</th><th></th></tr></thead>
       <tbody id="events-body"></tbody>
     </table>
     <p><button class="act" id="more">Load more</button></p>
@@ -92,12 +97,18 @@
     <div class="err" id="live-error" hidden></div>
     <div class="stats">
       <div class="stat"><b id="l-level">–</b><span>level dBFS</span></div>
-      <div class="stat"><b id="l-ambient">–</b><span>ambient dBFS</span></div>
+      <div class="stat"><b id="l-ambient">–</b><span id="l-ambient-note">ambient dBFS</span></div>
       <div class="stat"><b id="l-open">–</b><span>opens above</span></div>
       <div class="stat"><b id="l-state">–</b><span id="l-device">device</span></div>
     </div>
     <canvas id="meter"></canvas>
     <p class="hint">Last 30 s of 20 ms frame levels. Dashed: ambient; solid: open line (ambient × ratio); dotted: close line.</p>
+    <div class="tune">
+      <label>Open ratio <input type="range" id="t-ratio" min="1.2" max="20" step="0.1"><output id="o-ratio"></output></label>
+      <label>Close ratio <input type="range" id="t-close" min="1" max="10" step="0.1"><output id="o-close"></output></label>
+      <label>Ambient floor <input type="range" id="t-floor" min="-90" max="-20" step="1"><output id="o-floor"></output></label>
+      <div class="row"><span class="hint" id="t-source"></span><button class="act" id="t-reset" hidden>Reset to config file</button></div>
+    </div>
   </section>
 </main>
 <datalist id="known-labels"></datalist>
@@ -129,6 +140,11 @@ async function api(path, options) {
 function showError(msg) { $('error').textContent = msg; $('error').hidden = false; }
 
 const fmtTime = (ts) => new Date(ts).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+const fmtDuration = (e) => {
+  const s = Math.round(e.duration_ms / 100) / 10;
+  const text = s < 60 ? s.toFixed(1) + ' s' : Math.floor(s / 60) + ' min ' + Math.round(s % 60) + ' s';
+  return e.parts > 1 ? `${text} · ${e.parts} clips` : text;
+};
 const fmtDb = (v) => v == null ? '–' : v.toFixed(1);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 const cap = (s) => s ? s[0].toUpperCase() + s.slice(1) : s;
@@ -179,7 +195,7 @@ function renderReview() {
     <div class="card ${i === cursor ? 'current' : ''}" data-i="${i}">
       <div class="row">
         <button class="play" data-play="${e.id}" ${e.clip_path ? '' : 'disabled'}>▶</button>
-        <span class="hint">#${e.id} · ${fmtTime(e.ts)} · ${(e.duration_ms / 1000).toFixed(1)} s · peak ${fmtDb(e.peak_db)} dB over ${fmtDb(e.ambient_db)}</span>
+        <span class="hint">#${e.id} · ${fmtTime(e.ts)} · ${fmtDuration(e)} · peak ${fmtDb(e.peak_db)} dB over ${fmtDb(e.ambient_db)}</span>
       </div>
       <div class="question">${esc(cap(e.label))}?</div>
       <div class="row" style="margin-bottom:10px">
@@ -252,6 +268,7 @@ async function loadEvents(append) {
       <td>${esc(e.label)}${e.exemplar ? ' ★' : ''}</td>
       <td class="wide-only">${e.nearest_label ? esc(e.nearest_label) + ' ' + e.similarity.toFixed(2) : '–'}</td>
       <td class="wide-only">${esc(e.top_classes?.[0]?.[0] ?? '')}</td>
+      <td class="wide-only">${fmtDuration(e)}</td>
       <td class="wide-only">${fmtDb(e.peak_db)} / ${fmtDb(e.ambient_db)}</td>
       <td><button class="act" data-relabel>Relabel</button></td>
     </tr>`).join('');
@@ -285,6 +302,10 @@ async function pollLive() {
     const last = levels[levels.length - 1];
     $('l-level').textContent = fmtDb(last);
     $('l-ambient').textContent = fmtDb(live.ambient_db);
+    const measured = live.measured_ambient_db;
+    $('l-ambient-note').textContent = measured != null && measured < live.ambient_db
+      ? `ambient dBFS · floor; room measures ${fmtDb(measured)}` : 'ambient dBFS';
+    showTuning(live);
     $('l-open').textContent = fmtDb(live.open_db);
     $('l-state').innerHTML = live.error ? '<span class="rec">no audio</span>' : live.recording ? '<span class="rec">● recording</span>' : 'listening';
     $('live-error').hidden = !live.error;
@@ -293,6 +314,38 @@ async function pollLive() {
     draw();
   } catch (_) {}
 }
+// Sliders follow the daemon's values unless one is being dragged.
+let dragging = false;
+const dbOver = (ratio) => '+' + (20 * Math.log10(ratio)).toFixed(1) + ' dB';
+function showTuning(live, force) {
+  const t = live.tuning;
+  if (!t || (dragging && !force)) return;
+  $('t-ratio').value = t.ratio; $('t-close').value = t.close_ratio; $('t-floor').value = t.ambient_floor_db;
+  updateOutputs();
+  $('t-source').textContent = live.tuned ? 'Set here; overrides the config file.' : 'From the config file.';
+  $('t-reset').hidden = !live.tuned;
+}
+function updateOutputs() {
+  const r = Number($('t-ratio').value), c = Number($('t-close').value);
+  $('o-ratio').textContent = `× ${r.toFixed(1)} (${dbOver(r)})`;
+  $('o-close').textContent = `× ${c.toFixed(1)} (${dbOver(c)})`;
+  $('o-floor').textContent = `${$('t-floor').value} dBFS`;
+}
+async function sendTuning() {
+  const ratio = Number($('t-ratio').value);
+  const close_ratio = Math.min(Number($('t-close').value), ratio - 0.1);
+  const body = { ratio, close_ratio, ambient_floor_db: Number($('t-floor').value) };
+  try { showTuning(Object.assign(live || {}, await api('/api/trigger', { method: 'POST', body: JSON.stringify(body) })), true); } catch (_) {}
+}
+for (const id of ['t-ratio', 't-close', 't-floor']) {
+  const el = $(id);
+  el.addEventListener('input', () => { dragging = true; updateOutputs(); });
+  el.addEventListener('change', async () => { await sendTuning(); dragging = false; });
+}
+$('t-reset').addEventListener('click', async () => {
+  try { showTuning(Object.assign(live || {}, await api('/api/trigger', { method: 'DELETE' })), true); } catch (_) {}
+});
+
 function draw() {
   const c = $('meter'), dpr = window.devicePixelRatio || 1;
   const w = c.clientWidth, h = c.clientHeight;

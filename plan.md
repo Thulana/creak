@@ -58,6 +58,7 @@ mic ─▶ capture ─▶ level meter ─▶ trigger ─▶ clip (WAV) ─▶ em
 - **Close** when the level stays below `ambient × close_ratio` for `hang_ms`.
 - The clip includes 1.5 s of pre-roll from the ring buffer and is cut at `max_clip_s` (default 15 s).
 - A cooldown stops one long noise from producing a storm of events.
+- **Grouping.** A clip whose label equals the previous event's, and that starts within `group_gap_s` (default 10 s) of that event's end, extends the event instead of creating a new one: its duration grows and its clip count goes up, and only the first clip's audio is kept. Continuous music becomes one event, not one every 17 s.
 
 ### 3.2 Tagging
 
@@ -119,7 +120,7 @@ Turned on or off with `[web] enabled`. With it off, the daemon, the CLI and MQTT
 | **Review** | The pending queue, newest first. Each clip has a play button, the proposed label as a question ("Door?"), the model's top classes, and confirm / correct / ignore. Keyboard shortcuts for all four, so a queue clears quickly. |
 | **Events** | The event log, filtered by label and status. Every row plays its clip, shows the nearest exemplar and similarity, and can be relabelled. |
 | **Labels** | Exemplar count per label, and how often its matches were corrected. Rename, delete, switch between `event` and `scene`. |
-| **Live** | Current level, ambient and the trigger lines, for checking the microphone and tuning `ratio` from a browser. |
+| **Live** | Current level, measured ambient and the trigger lines, for checking the microphone. Sliders for `ratio`, `close_ratio` and `ambient_floor_db` apply at once; they are stored in the database and override the config file until reset. |
 
 - One static HTML file with plain JavaScript, embedded in the binary. No build step, no framework.
 - It talks to a small JSON API on the same port; clips are served as WAV with range requests, so every browser's own audio player works.
@@ -163,6 +164,7 @@ ambient_floor_db = -60
 [classify]
 match_threshold = 0.80
 suggest_threshold = 0.60
+group_gap_s = 10
 publish_pending = false
 
 [storage]

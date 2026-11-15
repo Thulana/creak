@@ -38,6 +38,9 @@ pub struct Trigger {
 pub struct Classify {
     pub match_threshold: f32,
     pub suggest_threshold: f32,
+    /// A clip with the same label that starts within this many seconds of the previous
+    /// event's end extends that event instead of starting a new one. 0 turns grouping off.
+    pub group_gap_s: u32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -78,7 +81,7 @@ impl Default for Trigger {
 
 impl Default for Classify {
     fn default() -> Self {
-        Self { match_threshold: 0.80, suggest_threshold: 0.60 }
+        Self { match_threshold: 0.80, suggest_threshold: 0.60, group_gap_s: 10 }
     }
 }
 
@@ -91,6 +94,45 @@ impl Default for Storage {
 impl Default for Web {
     fn default() -> Self {
         Self { enabled: true, listen: "127.0.0.1:8377".into(), token: String::new() }
+    }
+}
+
+/// The trigger values that can be changed from the Live view. They are stored in the
+/// database and override the config file until reset.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub struct Tuning {
+    pub ratio: f32,
+    pub close_ratio: f32,
+    pub ambient_floor_db: f32,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Trigger::default().tuning()
+    }
+}
+
+impl Trigger {
+    pub fn tuning(&self) -> Tuning {
+        Tuning { ratio: self.ratio, close_ratio: self.close_ratio, ambient_floor_db: self.ambient_floor_db }
+    }
+
+    pub fn with_tuning(&self, t: Tuning) -> Self {
+        Self { ratio: t.ratio, close_ratio: t.close_ratio, ambient_floor_db: t.ambient_floor_db, ..self.clone() }
+    }
+
+    /// The live-tunable values must keep the open line above the close line.
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.ratio > 1.0 && self.ratio <= 100.0, "ratio must be above 1 and at most 100");
+        anyhow::ensure!(
+            self.close_ratio >= 1.0 && self.close_ratio < self.ratio,
+            "close_ratio must be at least 1 and below ratio"
+        );
+        anyhow::ensure!(
+            (-100.0..=-10.0).contains(&self.ambient_floor_db),
+            "ambient_floor_db must be between -100 and -10"
+        );
+        Ok(())
     }
 }
 

@@ -1,6 +1,6 @@
 //! The web UI: one embedded page and a small JSON API on the same port.
 
-use crate::config;
+use crate::config::{self, Tuning};
 use crate::daemon::SharedLive;
 use crate::store::{Filter, Store};
 use anyhow::{Result, anyhow};
@@ -14,18 +14,25 @@ const PAGE: &str = include_str!("../ui/index.html");
 
 type Reply = Response<std::io::Cursor<Vec<u8>>>;
 
-pub fn serve(config: &config::Web, mut store: Store, live: SharedLive) -> Result<()> {
+/// `file_tuning` holds the config file's trigger values, which a reset in the Live view returns to.
+pub fn serve(config: &config::Web, file_tuning: Tuning, mut store: Store, live: SharedLive) -> Result<()> {
     let server = Server::http(&config.listen).map_err(|e| anyhow!("listening on {}: {e}", config.listen))?;
     eprintln!("web UI on http://{}/", config.listen);
     for mut request in server.incoming_requests() {
-        let reply =
-            handle(&mut request, &config.token, &mut store, &live).unwrap_or_else(|e| text(500, &format!("{e:#}")));
+        let reply = handle(&mut request, &config.token, file_tuning, &mut store, &live)
+            .unwrap_or_else(|e| text(500, &format!("{e:#}")));
         let _ = request.respond(reply);
     }
     Ok(())
 }
 
-fn handle(request: &mut Request, token: &str, store: &mut Store, live: &SharedLive) -> Result<Reply> {
+fn handle(
+    request: &mut Request,
+    token: &str,
+    file_tuning: Tuning,
+    store: &mut Store,
+    live: &SharedLive,
+) -> Result<Reply> {
     let url = request.url().to_string();
     let (path, query) = split_url(&url);
     let path: Vec<&str> = path.trim_matches('/').split('/').collect();
@@ -46,6 +53,7 @@ fn handle(request: &mut Request, token: &str, store: &mut Store, live: &SharedLi
                 "device": l.device, "device_rate": l.device_rate, "frame": l.frame,
                 "levels": l.levels.iter().skip(l.levels.len() - fresh).collect::<Vec<_>>(),
                 "ambient_db": l.ambient_db, "open_db": l.open_db, "close_db": l.close_db, "recording": l.recording, "error": l.error,
+                "measured_ambient_db": l.measured_ambient_db, "tuning": l.tuning, "tuned": l.tuned,
             }))
         }
         (Method::Get, ["api", "events"]) => {
@@ -61,14 +69,26 @@ fn handle(request: &mut Request, token: &str, store: &mut Store, live: &SharedLi
         (Method::Get, ["api", "labels"]) => {
             json_reply(&json!({ "labels": store.labels()?, "pending": store.pending_count()? }))
         }
+        (Method::Post, ["api", "trigger"]) => {
+            let Ok(tuning) = serde_json::from_str::<Tuning>(&read_body(request)?) else {
+                return Ok(text(400, "expected {\"ratio\", \"close_ratio\", \"ambient_floor_db\"}"));
+            };
+            if let Err(e) = config::Trigger::default().with_tuning(tuning).validate() {
+                return Ok(text(400, &e.to_string()));
+            }
+            store.set_trigger_tuning(Some(&tuning))?;
+            retune(live, tuning, true)
+        }
+        (Method::Delete, ["api", "trigger"]) => {
+            store.set_trigger_tuning(None)?;
+            retune(live, file_tuning, false)
+        }
         (Method::Post, ["api", "events", id, "label"]) => {
             #[derive(Deserialize)]
             struct Body {
                 label: String,
             }
-            let mut body = String::new();
-            request.as_reader().take(4096).read_to_string(&mut body)?;
-            let Ok(body) = serde_json::from_str::<Body>(&body) else {
+            let Ok(body) = serde_json::from_str::<Body>(&read_body(request)?) else {
                 return Ok(text(400, "expected {\"label\": \"…\"}"));
             };
             let Ok(id) = id.parse() else { return Ok(text(404, "no such event")) };
@@ -91,6 +111,18 @@ fn handle(request: &mut Request, token: &str, store: &mut Store, live: &SharedLi
         }
         _ => text(404, "not found"),
     })
+}
+
+fn retune(live: &SharedLive, tuning: Tuning, tuned: bool) -> Reply {
+    let mut l = live.lock().unwrap();
+    (l.tuning, l.tuned, l.retune) = (tuning, tuned, true);
+    json_reply(&json!({ "tuning": l.tuning, "tuned": l.tuned }))
+}
+
+fn read_body(request: &mut Request) -> Result<String> {
+    let mut body = String::new();
+    request.as_reader().take(4096).read_to_string(&mut body)?;
+    Ok(body)
 }
 
 fn authorized(request: &Request, query: &HashMap<String, String>, token: &str) -> bool {
