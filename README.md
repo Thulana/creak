@@ -96,7 +96,7 @@ group_gap_s = 10          # a same-label clip within this many seconds extends t
 [storage]
 dir = "/var/lib/creak"
 retention_days = 14       # clips that are not examples are deleted after this
-max_clip_mb = 2000        # beyond this, the oldest clips that are not examples are deleted first
+max_mb = 2000             # all clips together; beyond this the oldest that are not examples go first
 
 [web]
 enabled = true

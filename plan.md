@@ -128,7 +128,7 @@ A clip often holds more than one sound: music, several voices, a laugh. Its tags
 - `classifications`: everything the model and the classifier worked out for each clip, one row per clip, including clips grouped into an earlier event and clips dropped as silence. The class scores (all 521), the embedding, the top classes of every patch, the onset, sound end and analysis window, the decision with each label's best similarity and the nearest exemplar's event, the trigger and classify settings in effect, and the model's name. It is the long-term record: it never expires, so thresholds can be replayed and scenes and sound mixes (§3.4) computed for the past after the clips are gone. 10–16 KB per clip: 6 KB of embedding and scores, and the per-patch classes, which grow with the clip's length.
 - `labels(name, kind)` arrives with scenes; until then labels are derived from exemplars.
 - Clips will contain conversations. They never leave the machine.
-- Clips that are not exemplars are deleted after `retention_days` (default 14), and the oldest go first once all clips take more than `max_clip_mb` (default 2000). Both are checked every 10 minutes. Exemplar clips count towards the cap but are kept, so they can be re-embedded if the model changes.
+- Clips that are not exemplars are deleted after `retention_days` (default 14), and the oldest go first once all clips together take more than `max_mb` (default 2000). Both are checked every 10 minutes. Exemplar clips count towards the cap but are kept, so they can be re-embedded if the model changes.
 
 ### 3.6 MQTT
 
@@ -154,7 +154,7 @@ Turned on or off with `[web] enabled`. With it off, the daemon, the CLI and MQTT
 | **Events** | The event log, filtered by label and status. Every row plays its clip, shows the nearest exemplar and similarity, and can be relabelled. |
 | **Labels** | Exemplar count per label, and how often its matches were corrected. Rename, delete, switch between `event` and `scene`. |
 | **Live** | Current level, measured ambient and the trigger lines, for checking the microphone. Sliders for `ratio`, `close_ratio` and `ambient_floor_db`, the three settings worth changing while watching the meter. |
-| **Settings** | Every setting under `[trigger]` and `[classify]`, and `retention_days` and `max_clip_mb`, with its range and what it does. A change applies while the daemon runs and is stored in the database as an override of the config file until reset. The ranges live in `config.rs` and apply to the config file too. Device, listen address, token and data directory need a restart, so they stay in the file. |
+| **Settings** | Every setting under `[trigger]` and `[classify]`, and `retention_days` and `max_mb`, with its range and what it does. A change applies while the daemon runs and is stored in the database as an override of the config file until reset. The ranges live in `config.rs` and apply to the config file too. Device, listen address, token and data directory need a restart, so they stay in the file. |
 
 The header carries the active/deaf switch (§3.1).
 
@@ -237,7 +237,7 @@ publish_pending = false
 [storage]
 dir = "/var/lib/creak"
 retention_days = 14
-max_clip_mb = 2000
+max_mb = 2000
 
 [web]
 enabled = true

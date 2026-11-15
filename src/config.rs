@@ -59,8 +59,8 @@ pub struct Classify {
 pub struct Storage {
     pub dir: PathBuf,
     pub retention_days: u32,
-    /// When all clips take more than this, the oldest that are not exemplars are deleted.
-    pub max_clip_mb: u32,
+    /// The most space all clips together may take; beyond it, the oldest that are not exemplars are deleted.
+    pub max_mb: u32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -103,7 +103,7 @@ impl Default for Classify {
 
 impl Default for Storage {
     fn default() -> Self {
-        Self { dir: "/var/lib/creak".into(), retention_days: 14, max_clip_mb: 2000 }
+        Self { dir: "/var/lib/creak".into(), retention_days: 14, max_mb: 2000 }
     }
 }
 
@@ -287,8 +287,8 @@ pub const FIELDS: &[Field] = &[
         help: "Clips that are not taught examples are deleted after this many days.",
     },
     Field {
-        key: "storage.max_clip_mb",
-        name: "Clip space",
+        key: "storage.max_mb",
+        name: "Space for all clips",
         unit: "MB",
         min: 10.0,
         max: 1_000_000.0,

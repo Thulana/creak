@@ -233,9 +233,9 @@ fn classify_loop(settings: &SharedSettings, store: Store, tagger: Tagger, clips:
                 Ok(n) => eprintln!("expired {n} clips"),
                 Err(e) => eprintln!("expiring clips: {e:#}"),
             }
-            match store.cap_clips(config.storage.max_clip_mb) {
+            match store.cap_clips(config.storage.max_mb) {
                 Ok(0) => {}
-                Ok(n) => eprintln!("deleted the {n} oldest clips to stay under {} MB", config.storage.max_clip_mb),
+                Ok(n) => eprintln!("deleted the {n} oldest clips to stay under {} MB", config.storage.max_mb),
                 Err(e) => eprintln!("capping clip space: {e:#}"),
             }
             last_expiry = Some(Instant::now());
