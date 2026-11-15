@@ -1,0 +1,316 @@
+//! `creak run`: capture → trigger → clip → tag → store, plus the web UI.
+
+use crate::capture::{self, Resampler};
+use crate::classify;
+use crate::config::Config;
+use crate::embed::{self, Tagger};
+use crate::store::{NewEvent, Store, now_ms};
+use crate::trigger::{self, Event, FRAME, SAMPLE_RATE, Trigger};
+use anyhow::{Context, Result, bail};
+use serde::Serialize;
+use std::collections::VecDeque;
+use std::path::Path;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const PREROLL_SAMPLES: usize = SAMPLE_RATE as usize * 3 / 2;
+const RING_SAMPLES: usize = SAMPLE_RATE as usize * 2;
+/// Context kept before the trigger point when embedding, so the onset is not cut off.
+const ONSET_MARGIN_SAMPLES: usize = SAMPLE_RATE as usize / 10;
+const LIVE_FRAMES: usize = 30 * 1000 / trigger::FRAME_MS as usize;
+const STALL: Duration = Duration::from_secs(10);
+const EXPIRE_EVERY: Duration = Duration::from_secs(3600);
+
+/// What the Live view shows: recent frame levels and the current trigger lines.
+#[derive(Default, Serialize)]
+pub struct Live {
+    pub device: String,
+    pub device_rate: u32,
+    /// Index of the frame after the last one in `levels`.
+    pub frame: u64,
+    pub levels: VecDeque<f32>,
+    pub ambient_db: f32,
+    pub open_db: f32,
+    pub close_db: f32,
+    pub recording: bool,
+}
+
+pub type SharedLive = Arc<Mutex<Live>>;
+
+pub struct Clip {
+    pub samples: Vec<f32>,
+    /// Where the triggering sound starts within `samples`; everything before is pre-roll.
+    pub onset: usize,
+    pub ts: i64,
+    pub peak_db: f32,
+    pub ambient_db: f32,
+}
+
+pub fn run(config: Config) -> Result<()> {
+    let store = Store::open(&config.storage.dir)?;
+    let tagger = Tagger::load()?;
+    eprintln!("model loaded; storage at {}", config.storage.dir.display());
+    let live = SharedLive::default();
+
+    if config.web.enabled {
+        let web_store = Store::open(&config.storage.dir)?;
+        let (web, live) = (config.web.clone(), live.clone());
+        std::thread::spawn(move || {
+            if let Err(e) = crate::web::serve(&web, web_store, live) {
+                eprintln!("web UI stopped: {e:#}");
+                std::process::exit(1);
+            }
+        });
+    }
+
+    let (clips_tx, clips_rx) = channel();
+    let classify_config = config.clone();
+    let classifier = std::thread::spawn(move || classify_loop(&classify_config, store, tagger, clips_rx));
+
+    let input = capture::open(&config.audio.device)?;
+    eprintln!("capturing from {} at {} Hz", input.name, input.rate);
+    {
+        let mut l = live.lock().unwrap();
+        l.device = input.name.clone();
+        l.device_rate = input.rate;
+    }
+    let result = capture_loop(&config, &input.chunks, input.rate, &live, &clips_tx);
+    drop(clips_tx);
+    let _ = classifier.join();
+    result
+}
+
+fn capture_loop(
+    config: &Config,
+    chunks: &Receiver<Vec<f32>>,
+    rate: u32,
+    live: &SharedLive,
+    clips: &Sender<Clip>,
+) -> Result<()> {
+    let mut resampler = Resampler::new(rate);
+    let mut trigger = Trigger::new(&config.trigger);
+    let mut ring: VecDeque<f32> = VecDeque::with_capacity(RING_SAMPLES);
+    let mut pending: Vec<f32> = Vec::new();
+    let mut resampled = Vec::new();
+    let mut clip: Option<Clip> = None;
+    let mut frame_index: u64 = 0;
+
+    loop {
+        let chunk = match chunks.recv_timeout(STALL) {
+            Ok(chunk) => chunk,
+            Err(RecvTimeoutError::Timeout) => bail!("no audio from the device for {}s", STALL.as_secs()),
+            Err(RecvTimeoutError::Disconnected) => bail!("audio stream closed"),
+        };
+        resampled.clear();
+        resampler.process(&chunk, &mut resampled);
+        pending.extend_from_slice(&resampled);
+
+        let whole = pending.len() / FRAME * FRAME;
+        for frame in pending[..whole].as_chunks::<FRAME>().0 {
+            if ring.len() + FRAME > RING_SAMPLES {
+                ring.drain(..ring.len() + FRAME - RING_SAMPLES);
+            }
+            ring.extend(frame);
+            if let Some(c) = clip.as_mut() {
+                c.samples.extend_from_slice(frame);
+            }
+
+            let level = trigger::level_db(frame);
+            match trigger.push(level) {
+                Some(Event::Open { start }) => {
+                    // The ring ends at frame `frame_index`; the run started `back` samples ago.
+                    let back = ((frame_index + 1 - start) as usize * FRAME).min(ring.len());
+                    let take = (back + PREROLL_SAMPLES).min(ring.len());
+                    let samples: Vec<f32> = ring.range(ring.len() - take..).copied().collect();
+                    let ts = now_ms() - (take as i64 * 1000 / SAMPLE_RATE as i64);
+                    clip = Some(Clip {
+                        samples,
+                        onset: take - back,
+                        ts,
+                        peak_db: level,
+                        ambient_db: trigger.ambient_db(),
+                    });
+                }
+                Some(Event::Close { peak_db, ambient_db, .. }) => {
+                    if let Some(mut c) = clip.take() {
+                        c.peak_db = peak_db;
+                        c.ambient_db = ambient_db;
+                        clips.send(c).context("classifier thread stopped")?;
+                    }
+                }
+                None => {}
+            }
+            frame_index += 1;
+
+            let (open_db, close_db) = trigger.thresholds_db();
+            let mut l = live.lock().unwrap();
+            if l.levels.len() == LIVE_FRAMES {
+                l.levels.pop_front();
+            }
+            l.levels.push_back(level);
+            l.frame = frame_index;
+            l.ambient_db = trigger.ambient_db();
+            (l.open_db, l.close_db) = (open_db, close_db);
+            l.recording = trigger.is_open();
+        }
+        pending.drain(..whole);
+    }
+}
+
+fn classify_loop(config: &Config, store: Store, tagger: Tagger, clips: Receiver<Clip>) {
+    let mut last_expiry: Option<Instant> = None;
+    loop {
+        if last_expiry.is_none_or(|t| t.elapsed() >= EXPIRE_EVERY) {
+            match store.expire(config.storage.retention_days) {
+                Ok(0) => {}
+                Ok(n) => eprintln!("expired {n} clips"),
+                Err(e) => eprintln!("expiring clips: {e:#}"),
+            }
+            last_expiry = Some(Instant::now());
+        }
+        match clips.recv_timeout(Duration::from_secs(60)) {
+            Ok(clip) => {
+                if let Err(e) = handle_clip(config, &store, &tagger, &clip) {
+                    eprintln!("clip at {}: {e:#}", clip.ts);
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+/// The part of the clip that is embedded: from just before the onset to the end, widened
+/// into the pre-roll when that is shorter than one model patch.
+pub fn analysis_window(clip: &Clip) -> &[f32] {
+    let start = clip.onset.saturating_sub(ONSET_MARGIN_SAMPLES);
+    let start = start.min(clip.samples.len().saturating_sub(embed::MIN_SAMPLES));
+    &clip.samples[start..]
+}
+
+fn handle_clip(config: &Config, store: &Store, tagger: &Tagger, clip: &Clip) -> Result<()> {
+    let started = Instant::now();
+    let tags = tagger.tag(analysis_window(clip))?;
+    let top = tagger.top_classes(&tags.scores, 3);
+    let c = &config.classify;
+    let decision =
+        classify::decide(&tags.embedding, &store.exemplars()?, &top[0].0, c.match_threshold, c.suggest_threshold);
+
+    let clip_path = if decision.status == classify::Status::Ignored {
+        None
+    } else {
+        let day = chrono::DateTime::from_timestamp_millis(clip.ts).unwrap_or_default().format("%Y-%m-%d");
+        let rel = format!("clips/{day}/{}.wav", clip.ts);
+        write_wav(&store.dir().join(&rel), &clip.samples)?;
+        Some(rel)
+    };
+    let id = store.insert_event(&NewEvent {
+        ts: clip.ts,
+        duration_ms: clip.samples.len() as i64 * 1000 / SAMPLE_RATE as i64,
+        peak_db: clip.peak_db,
+        ambient_db: clip.ambient_db,
+        decision: &decision,
+        top_classes: &top,
+        clip_path: clip_path.as_deref(),
+        embedding: &tags.embedding,
+    })?;
+    let nearest = decision.nearest.map(|(l, s)| format!(", nearest {l} {s:.2}")).unwrap_or_default();
+    eprintln!(
+        "event {id}: {:?} {:?} ({}{nearest}) in {} ms",
+        decision.status,
+        decision.label,
+        top.iter().map(|(n, s)| format!("{n} {s:.2}")).collect::<Vec<_>>().join(", "),
+        started.elapsed().as_millis()
+    );
+    Ok(())
+}
+
+fn write_wav(path: &Path, samples: &[f32]) -> Result<()> {
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: SAMPLE_RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut w = hound::WavWriter::create(path, spec)?;
+    for s in samples {
+        w.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
+    }
+    w.finalize()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clip(len: usize, onset: usize) -> Clip {
+        Clip { samples: vec![0.0; len], onset, ts: 0, peak_db: 0.0, ambient_db: 0.0 }
+    }
+
+    #[test]
+    fn window_skips_preroll_for_long_sounds() {
+        let c = clip(PREROLL_SAMPLES + 40_000, PREROLL_SAMPLES);
+        assert_eq!(analysis_window(&c).len(), 40_000 + ONSET_MARGIN_SAMPLES);
+    }
+
+    #[test]
+    fn window_widens_into_preroll_for_short_sounds() {
+        let c = clip(PREROLL_SAMPLES + 4_000, PREROLL_SAMPLES);
+        assert_eq!(analysis_window(&c).len(), embed::MIN_SAMPLES);
+    }
+
+    /// Quiet noise, then the fixture sound, then quiet again: one clip, tagged and stored as
+    /// pending; after labelling it, the same sound is a match.
+    #[test]
+    fn pipeline_from_audio_to_event() {
+        let dir = std::env::temp_dir().join(format!("creak-pipeline-{}", std::process::id()));
+        let mut config = Config::default();
+        config.storage.dir = dir.clone();
+        let mut seed = 1u32;
+        let mut noise = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (seed >> 8) as f32 / (1u32 << 24) as f32 * 0.002 - 0.001
+                })
+                .collect()
+        };
+        let sound: Vec<f32> = hound::WavReader::open(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synth.wav"))
+            .unwrap()
+            .samples::<i16>()
+            .map(|s| s.unwrap() as f32 / 32768.0)
+            .collect();
+
+        let feed = |audio: Vec<f32>| {
+            let (chunks_tx, chunks_rx) = channel();
+            let (clips_tx, clips_rx) = channel();
+            for chunk in audio.chunks(1000) {
+                chunks_tx.send(chunk.to_vec()).unwrap();
+            }
+            drop(chunks_tx);
+            let err = capture_loop(&config, &chunks_rx, SAMPLE_RATE, &SharedLive::default(), &clips_tx).unwrap_err();
+            assert!(err.to_string().contains("closed"));
+            clips_rx.try_iter().collect::<Vec<Clip>>()
+        };
+        let audio = [noise(16_000 * 6), sound.clone(), noise(16_000 * 3)].concat();
+        let clips = feed(audio.clone());
+        assert_eq!(clips.len(), 1);
+        assert_eq!(clips[0].onset, PREROLL_SAMPLES);
+
+        let mut store = Store::open(&dir).unwrap();
+        let tagger = Tagger::load().unwrap();
+        handle_clip(&config, &store, &tagger, &clips[0]).unwrap();
+        let first = &store.events(&crate::store::Filter { limit: 1, ..Default::default() }).unwrap()[0];
+        assert_eq!(first.status, "pending");
+        assert!(dir.join(first.clip_path.as_ref().unwrap()).exists());
+
+        store.label_event(first.id, "chirp").unwrap();
+        handle_clip(&config, &store, &tagger, &feed(audio).remove(0)).unwrap();
+        let second = &store.events(&crate::store::Filter { limit: 1, ..Default::default() }).unwrap()[0];
+        assert_eq!((second.status.as_str(), second.label.as_str()), ("match", "chirp"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
