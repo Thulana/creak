@@ -190,6 +190,9 @@ impl Store {
     /// Applies a user's label. The clip becomes (or replaces) an exemplar for that label.
     pub fn label_event(&mut self, id: i64, raw_label: &str) -> Result<Event> {
         let Some(label) = classify::normalize_label(raw_label) else { bail!("empty or too long label") };
+        if label == classify::SILENCE {
+            bail!("silence is not a sound to label; use ignore for a sound you never want to hear about");
+        }
         let tx = self.conn.transaction()?;
         let (old_label, embedding): (String, Vec<u8>) = tx
             .query_row("SELECT label, embedding FROM events WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -314,6 +317,14 @@ mod tests {
         let exemplars = store.exemplars().unwrap();
         assert_eq!(exemplars.len(), 1);
         assert_eq!((exemplars[0].label.as_str(), exemplars[0].embedding.clone()), ("back door", vec![0.6, 0.8]));
+    }
+
+    #[test]
+    fn silence_is_not_a_label() {
+        let mut store = temp_store();
+        let id = insert(&store, now_ms(), "door", &[1.0]);
+        assert!(store.label_event(id, " Silence ").is_err());
+        assert!(store.exemplars().unwrap().is_empty());
     }
 
     #[test]

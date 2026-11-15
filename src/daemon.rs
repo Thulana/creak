@@ -232,10 +232,14 @@ struct Latest {
 fn handle_clip(config: &Config, store: &Store, tagger: &Tagger, clip: &Clip, last: &mut Option<Latest>) -> Result<()> {
     let started = Instant::now();
     let tags = tagger.tag(analysis_window(clip))?;
-    let top = tagger.top_classes(&tags.scores, 3);
+    let sounds = classify::sounds(tagger.top_classes(&tags.scores, 20));
+    let top = &sounds[..sounds.len().min(3)];
     let c = &config.classify;
-    let decision =
-        classify::decide(&tags.embedding, &store.exemplars()?, &top[0].0, c.match_threshold, c.suggest_threshold);
+    let decision = classify::decide(&tags.embedding, &store.exemplars()?, top, c.match_threshold, c.suggest_threshold);
+    if decision.status == classify::Status::Silent {
+        eprintln!("dropped a clip with nothing but silence or room tone");
+        return Ok(());
+    }
     let ms = |samples: usize| samples as i64 * 1000 / SAMPLE_RATE as i64;
     let (onset_ts, end_ts) = (clip.ts + ms(clip.onset), clip.ts + ms(clip.samples.len()));
 
@@ -266,7 +270,7 @@ fn handle_clip(config: &Config, store: &Store, tagger: &Tagger, clip: &Clip, las
         peak_db: clip.peak_db,
         ambient_db: clip.ambient_db,
         decision: &decision,
-        top_classes: &top,
+        top_classes: top,
         clip_path: clip_path.as_deref(),
         embedding: &tags.embedding,
     })?;
