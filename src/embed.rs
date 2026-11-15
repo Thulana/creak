@@ -36,6 +36,8 @@ pub struct Tags {
     pub embedding: Vec<f32>,
     /// One score per class for each 0.96 s patch, in time order.
     pub patch_scores: Vec<Vec<f32>>,
+    /// The embedding of each patch, in time order, not normalised.
+    pub patch_embeddings: Vec<Vec<f32>>,
 }
 
 pub struct Tagger {
@@ -87,10 +89,12 @@ impl Tagger {
             sum.iter_mut().for_each(|s| *s /= rows.len() as f32);
             sum
         };
-        let mut embedding = mean(&embeddings);
-        let norm = embedding.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-12);
-        embedding.iter_mut().for_each(|v| *v /= norm);
-        Ok(Tags { scores: mean(&scores), embedding, patch_scores: scores })
+        Ok(Tags {
+            scores: mean(&scores),
+            embedding: normalized(mean(&embeddings)),
+            patch_scores: scores,
+            patch_embeddings: embeddings,
+        })
     }
 
     /// Per-patch (scores, embeddings) for a log-mel spectrogram.
@@ -130,6 +134,13 @@ impl Tagger {
             })
             .collect()
     }
+}
+
+/// Scaled to unit length, so a dot product is a cosine similarity.
+pub fn normalized(mut v: Vec<f32>) -> Vec<f32> {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+    v.iter_mut().for_each(|x| *x /= norm);
+    v
 }
 
 /// Zero-pads to at least one patch and then to a whole number of patch hops, as YAMNet does.

@@ -2,7 +2,7 @@
 
 use crate::config::{self, Config, Mode, Overrides};
 use crate::daemon::{SharedLive, SharedSettings};
-use crate::store::{Filter, Store};
+use crate::store::{CheckAnswer, Filter, Store};
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -65,12 +65,13 @@ fn handle(
                 since_ms: None,
                 before_id: query.get("before").and_then(|s| s.parse().ok()),
                 hide_ignored: query.get("hide_ignored").is_some_and(|v| v == "1"),
+                review: query.get("review").is_some_and(|v| v == "1"),
                 limit: query.get("limit").and_then(|s| s.parse().ok()).unwrap_or(50).clamp(1, 500),
             };
             json_reply(&json!({ "events": store.events(&filter)? }))
         }
         (Method::Get, ["api", "labels"]) => {
-            json_reply(&json!({ "labels": store.labels()?, "pending": store.pending_count()? }))
+            json_reply(&json!({ "labels": store.labels()?, "review": store.review_count()? }))
         }
         (Method::Get, ["api", "settings"]) => settings_reply(file, store, settings)?,
         (Method::Patch, ["api", "settings"]) => {
@@ -116,9 +117,45 @@ fn handle(
             };
             let Ok(id) = id.parse() else { return Ok(text(404, "no such event")) };
             match store.label_event(id, &body.label) {
+                Ok(labelled) => json_reply(&serde_json::to_value(labelled)?),
+                Err(e) => text(400, &format!("{e:#}")),
+            }
+        }
+        (Method::Post, ["api", "events", id, "skip"]) => {
+            let Ok(id) = id.parse() else { return Ok(text(404, "no such event")) };
+            match store.skip_event(id) {
                 Ok(event) => json_reply(&json!({ "event": event })),
                 Err(e) => text(400, &format!("{e:#}")),
             }
+        }
+        (Method::Post, ["api", "events", id, "check"]) => {
+            #[derive(Deserialize)]
+            struct Body {
+                answer: CheckAnswer,
+            }
+            let Ok(Body { answer }) = serde_json::from_str(&read_body(request)?) else {
+                return Ok(text(400, "expected {\"answer\": \"right\"} or {\"answer\": \"unsure\"}"));
+            };
+            let Ok(id) = id.parse() else { return Ok(text(404, "no such event")) };
+            match store.answer_check(id, answer) {
+                Ok(event) => json_reply(&json!({ "event": event })),
+                Err(e) => text(400, &format!("{e:#}")),
+            }
+        }
+        (Method::Get, ["api", "audit"]) => audit_reply(store)?,
+        (Method::Post, ["api", "audit", id]) => {
+            #[derive(Deserialize)]
+            struct Body {
+                label: Option<String>,
+            }
+            let Ok(body) = serde_json::from_str::<Body>(&read_body(request)?) else {
+                return Ok(text(400, "expected {\"label\": \"…\"}, or {\"label\": null} when it cannot be told"));
+            };
+            let Ok(id) = id.parse() else { return Ok(text(404, "no such event")) };
+            if let Err(e) = store.audit(id, body.label.as_deref()) {
+                return Ok(text(400, &format!("{e:#}")));
+            }
+            audit_reply(store)?
         }
         (Method::Get, ["api", "clips", id]) => {
             let clip = id
@@ -172,6 +209,20 @@ fn settings_reply(file: &Config, store: &Store, settings: &SharedSettings) -> Re
         "mode": s.mode,
         "file_only": { "audio.device": file.audio.device, "storage.dir": file.storage.dir, "web.listen": file.web.listen },
         "clip_mb": clip_mb,
+    })))
+}
+
+/// The next clip to audit, and how far the audit has come. Nothing here says what creak
+/// thinks a clip is: an audit is an answer made without it.
+fn audit_reply(store: &Store) -> Result<Reply> {
+    let counts = store.audit_counts()?;
+    let (told, unclear): (Vec<_>, Vec<_>) = counts.iter().partition(|(label, _)| label.is_some());
+    Ok(json_reply(&json!({
+        "next": store.next_audit()?,
+        "audited": told.iter().map(|(_, n)| n).sum::<i64>(),
+        "unclear": unclear.iter().map(|(_, n)| n).sum::<i64>(),
+        "labels": told.iter().map(|(label, n)| json!({ "label": label, "clips": n })).collect::<Vec<_>>(),
+        "matches": store.match_stats()?,
     })))
 }
 

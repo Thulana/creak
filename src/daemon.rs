@@ -1,14 +1,15 @@
 //! `creak run`: capture → trigger → clip → tag → store, plus the web UI.
 
 use crate::capture::{self, Resampler};
-use crate::classify;
+use crate::classify::{self, MixPart};
 use crate::config::{Config, Mode, Overrides};
-use crate::embed::{self, Tagger};
+use crate::embed::{self, Tagger, Tags};
 use crate::store::{NewClassification, NewEvent, Store, now_ms};
 use crate::trigger::{self, Event, FRAME, FRAME_MS, SAMPLE_RATE, Trigger};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::collections::VecDeque;
+use std::hash::{BuildHasher, RandomState};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
@@ -20,6 +21,8 @@ const RING_EXTRA_SAMPLES: usize = SAMPLE_RATE as usize * 2;
 /// Context kept before the trigger point when embedding, so the onset is not cut off.
 const ONSET_MARGIN_SAMPLES: usize = SAMPLE_RATE as usize / 10;
 const LIVE_FRAMES: usize = 30 * 1000 / trigger::FRAME_MS as usize;
+/// Classes ranked per patch for the sound mix: more than ever reach `sound_score` in one patch.
+const PATCH_CLASSES: usize = 20;
 const STALL: Duration = Duration::from_secs(10);
 const RETRY: Duration = Duration::from_secs(10);
 const EXPIRE_EVERY: Duration = Duration::from_secs(600);
@@ -262,6 +265,40 @@ pub fn analysis_window(clip: &Clip) -> Range<usize> {
     start..end
 }
 
+/// What the model made of a clip.
+pub struct Analysis {
+    pub window: Range<usize>,
+    pub tags: Tags,
+    /// The ranked classes of each 0.96 s patch of the window.
+    pub patches: Vec<Vec<(String, f32)>>,
+    /// The model's view of the window without room tone, best first.
+    pub sounds: Vec<(String, f32)>,
+    /// The sounds heard in the pre-roll, or None when the clip has none.
+    pub background: Option<Vec<String>>,
+    pub mix: Vec<MixPart>,
+}
+
+/// Runs the model on the clip's window, and on its pre-roll to tell what was there before the
+/// onset. The pre-roll is never embedded.
+pub fn analyse(tagger: &Tagger, clip: &Clip, sound_score: f32) -> Result<Analysis> {
+    let ranked = |tags: &Tags| -> Vec<Vec<(String, f32)>> {
+        tags.patch_scores.iter().map(|p| tagger.top_classes(p, PATCH_CLASSES)).collect()
+    };
+    let window = analysis_window(clip);
+    let tags = tagger.tag(&clip.samples[window.clone()])?;
+    let patches = ranked(&tags);
+    let before = &clip.samples[..clip.onset.saturating_sub(ONSET_MARGIN_SAMPLES)];
+    let background = if before.is_empty() {
+        None
+    } else {
+        let parts = classify::mix(&ranked(&tagger.tag(before)?), &[], sound_score);
+        Some(parts.into_iter().map(|p| p.class).collect::<Vec<_>>())
+    };
+    let mix = classify::mix(&patches, background.as_deref().unwrap_or_default(), sound_score);
+    let sounds = classify::sounds(tagger.top_classes(&tags.scores, 20));
+    Ok(Analysis { window, tags, patches, sounds, background, mix })
+}
+
 /// The settings a classification was made with, stored next to it.
 #[derive(Serialize)]
 struct SettingsInEffect<'a> {
@@ -278,13 +315,12 @@ struct Latest {
 
 fn handle_clip(config: &Config, store: &Store, tagger: &Tagger, clip: &Clip, last: &mut Option<Latest>) -> Result<()> {
     let started = Instant::now();
-    let window = analysis_window(clip);
-    let tags = tagger.tag(&clip.samples[window.clone()])?;
-    let sounds = classify::sounds(tagger.top_classes(&tags.scores, 20));
-    let top = &sounds[..sounds.len().min(3)];
     let c = &config.classify;
+    let Analysis { window, tags, patches, sounds, background, mix } = analyse(tagger, clip, c.sound_score)?;
+    let top = &sounds[..sounds.len().min(3)];
     let exemplars = store.exemplars()?;
-    let decision = classify::decide(&tags.embedding, &exemplars, top, c);
+    let decision = classify::decide(&tags.embedding, &exemplars, top, &mix, c);
+    let candidates = classify::candidates(&tags.embedding, &exemplars, 5);
     let classify_ms = started.elapsed().as_millis() as i64;
     let ms = |samples: usize| samples as i64 * 1000 / SAMPLE_RATE as i64;
     let (onset_ts, end_ts) = (clip.ts + ms(clip.onset), clip.ts + ms(clip.samples.len()));
@@ -307,7 +343,8 @@ fn handle_clip(config: &Config, store: &Store, tagger: &Tagger, clip: &Clip, las
             eprintln!("event {}: extended with another {:?} clip", prev.id, decision.label);
             break 'event Some(prev.id);
         }
-        Some(new_event(store, clip, &decision, top, &tags.embedding, last, started)?)
+        let found = Found { decision: &decision, top, embedding: &tags.embedding, candidates: &candidates, mix: &mix };
+        Some(new_event(store, clip, &found, last, started)?)
     };
 
     store.insert_classification(&NewClassification {
@@ -322,27 +359,31 @@ fn handle_clip(config: &Config, store: &Store, tagger: &Tagger, clip: &Clip, las
         model: embed::MODEL_NAME,
         scores: &tags.scores,
         embedding: &tags.embedding,
-        patches: &tags.patch_scores.iter().map(|p| tagger.top_classes(p, 5)).collect::<Vec<_>>(),
+        patches: &patches.iter().map(|p| p[..p.len().min(5)].to_vec()).collect::<Vec<_>>(),
         top_sounds: &sounds[..sounds.len().min(10)],
         decision: &decision,
-        candidates: &classify::candidates(&tags.embedding, &exemplars, 5),
+        candidates: &candidates,
         settings: &serde_json::to_string(&SettingsInEffect { trigger: &config.trigger, classify: c })?,
         classify_ms,
+        mix: &mix,
+        background: background.as_deref(),
     })?;
     Ok(())
 }
 
+/// What the classifier found for a clip that starts a new event.
+struct Found<'a> {
+    decision: &'a classify::Decision,
+    top: &'a [(String, f32)],
+    embedding: &'a [f32],
+    candidates: &'a [(String, f32, i64)],
+    mix: &'a [MixPart],
+}
+
 /// Starts an event for a clip that is not grouped into the previous one, keeping its audio
-/// unless it is ignored.
-fn new_event(
-    store: &Store,
-    clip: &Clip,
-    decision: &classify::Decision,
-    top: &[(String, f32)],
-    embedding: &[f32],
-    last: &mut Option<Latest>,
-    started: Instant,
-) -> Result<i64> {
+/// unless it is ignored. A match may be sampled for a "was this right?" check.
+fn new_event(store: &Store, clip: &Clip, found: &Found, last: &mut Option<Latest>, started: Instant) -> Result<i64> {
+    let Found { decision, top, .. } = *found;
     let end_ts = clip.ts + clip.samples.len() as i64 * 1000 / SAMPLE_RATE as i64;
     let clip_path = if decision.status == classify::Status::Ignored {
         None
@@ -352,6 +393,8 @@ fn new_event(
         write_wav(&store.dir().join(&rel), &clip.samples)?;
         Some(rel)
     };
+    let check = decision.status == classify::Status::Match
+        && classify::check_due(decision.nearest.as_ref().map_or(0.0, |n| n.1), RandomState::new().hash_one(clip.ts));
     let id = store.insert_event(&NewEvent {
         ts: clip.ts,
         duration_ms: end_ts - clip.ts,
@@ -360,7 +403,10 @@ fn new_event(
         decision,
         top_classes: top,
         clip_path: clip_path.as_deref(),
-        embedding,
+        embedding: found.embedding,
+        nearest_event: found.candidates.first().map(|(.., event)| *event),
+        mix: found.mix,
+        check,
     })?;
     if decision.status != classify::Status::Ignored {
         *last = Some(Latest { id, end_ts });
@@ -516,6 +562,9 @@ mod tests {
                 top_classes: &[("Music".into(), 0.9)],
                 clip_path: None,
                 embedding: &tags.embedding,
+                nearest_event: None,
+                mix: &[],
+                check: false,
             })
             .unwrap();
         store.label_event(music, "music").unwrap();
@@ -529,6 +578,57 @@ mod tests {
         assert_eq!((newest.status.as_str(), newest.label.as_str()), ("pending", "music"));
         assert_eq!(newest.conflict.as_deref(), Some(heard.0.as_str()));
         assert_eq!(store.event(music).unwrap().unwrap().parts, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Steady noise, which the model hears as running water, then a square-wave alarm over it.
+    /// Its whole clip is close to a water clip and the model's best sound is still water, so
+    /// without the pre-roll it would be matched as water; the alarm is what came in.
+    #[test]
+    fn a_sound_over_the_background_is_not_tagged_as_the_background() {
+        let dir = std::env::temp_dir().join(format!("creak-foreground-{}", std::process::id()));
+        let mut config = Config::default();
+        config.storage.dir = dir.clone();
+        let mut store = Store::open(&dir).unwrap();
+        let tagger = Tagger::load().unwrap();
+        let mut seed = 7u32;
+        let water: Vec<f32> = (0..PRE_ROLL + 48_000)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 8) as f32 / (1u32 << 24) as f32 * 0.6 - 0.3
+            })
+            .collect();
+        let alarm = |i: usize| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16_000.0).sin().signum() * 0.3;
+        let mut with_alarm = water.clone();
+        with_alarm[PRE_ROLL + 16_000..PRE_ROLL + 32_000].iter_mut().enumerate().for_each(|(i, s)| *s += alarm(i));
+        let clip = |samples: Vec<f32>, ts: i64| Clip {
+            onset: PRE_ROLL,
+            sound_end: samples.len(),
+            samples,
+            ts,
+            peak_db: -10.0,
+            ambient_db: -20.0,
+        };
+
+        handle_clip(&config, &store, &tagger, &clip(water, 1_000_000), &mut None).unwrap();
+        let taught = store.events(&crate::store::Filter { limit: 1, ..Default::default() }).unwrap()[0].id;
+        store.label_event(taught, "water").unwrap();
+
+        let analysis = analyse(&tagger, &clip(with_alarm.clone(), 0), config.classify.sound_score).unwrap();
+        assert_eq!(analysis.sounds[0].0, "Waterfall", "the model's best sound is the background");
+        assert!(analysis.mix.iter().any(|p| p.class == "Waterfall" && p.background));
+        let without_preroll = Clip { onset: 0, ..clip(with_alarm[PRE_ROLL..].to_vec(), 0) };
+        let blind = analyse(&tagger, &without_preroll, config.classify.sound_score).unwrap();
+        let exemplars = store.exemplars().unwrap();
+        let d = classify::decide(&blind.tags.embedding, &exemplars, &blind.sounds, &blind.mix, &config.classify);
+        assert_eq!((d.status, d.label.as_str()), (classify::Status::Match, "water"), "{d:?}");
+
+        handle_clip(&config, &store, &tagger, &clip(with_alarm, 1_100_000), &mut None).unwrap();
+        let e = &store.events(&crate::store::Filter { limit: 1, ..Default::default() }).unwrap()[0];
+        assert_eq!((e.status.as_str(), e.nearest_label.as_deref()), ("pending", Some("water")));
+        let heard = e.conflict.clone().expect("the model's sound over the water");
+        assert_eq!(e.label, heard.to_lowercase(), "proposed as what came in, not as water");
+        assert!(e.mix.iter().any(|p| p.class == heard && !p.background));
         let _ = std::fs::remove_dir_all(dir);
     }
 
