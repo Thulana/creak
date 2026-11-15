@@ -37,6 +37,36 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL               -- JSON
 );
+-- Everything the classifier worked out for one clip, kept for good: one row per clip,
+-- including clips grouped into an earlier event and clips dropped as silence.
+CREATE TABLE IF NOT EXISTS classifications (
+    id            INTEGER PRIMARY KEY,
+    event_id      INTEGER REFERENCES events(id), -- the event it started or extended; NULL when dropped as silence
+    ts            INTEGER NOT NULL,   -- unix ms at clip start, pre-roll included
+    duration_ms   INTEGER NOT NULL,   -- the whole clip: pre-roll, sound and tail
+    onset_ms      INTEGER NOT NULL,   -- offsets within the clip: where the sound starts …
+    sound_end_ms  INTEGER NOT NULL,   -- … where it is over …
+    window_start_ms INTEGER NOT NULL, -- … and the part the model was given
+    window_end_ms INTEGER NOT NULL,
+    peak_db       REAL    NOT NULL,
+    ambient_db    REAL    NOT NULL,
+    model         TEXT    NOT NULL,   -- the model behind scores and embedding
+    scores        BLOB    NOT NULL,   -- mean score per model class, f32 LE, in the class map's order
+    embedding     BLOB    NOT NULL,   -- mean embedding, L2-normalised, f32 LE
+    patches       TEXT    NOT NULL,   -- JSON: for each 0.96 s patch, its top classes [[class, score], ...]
+    top_sounds    TEXT    NOT NULL,   -- JSON [[class, score], ...]: the model's view without room tone, best first
+    status        TEXT    NOT NULL,   -- the decision: match | pending | ignored | silent
+    label         TEXT    NOT NULL,   -- applied or proposed label; empty when silent
+    similarity    REAL,               -- to the nearest exemplar
+    nearest_label TEXT,
+    nearest_event INTEGER,            -- the event whose clip that exemplar is
+    candidates    TEXT    NOT NULL,   -- JSON [[label, similarity, event], ...]: each label's best exemplar, best first
+    conflict      TEXT,
+    settings      TEXT    NOT NULL,   -- JSON: the trigger and classify settings in effect
+    classify_ms   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS classifications_ts ON classifications(ts);
+CREATE INDEX IF NOT EXISTS classifications_event ON classifications(event_id);
 ";
 
 const OVERRIDES_KEY: &str = "overrides";
@@ -58,6 +88,27 @@ pub struct NewEvent<'a> {
     pub top_classes: &'a [(String, f32)],
     pub clip_path: Option<&'a str>,
     pub embedding: &'a [f32],
+}
+
+pub struct NewClassification<'a> {
+    pub event_id: Option<i64>,
+    pub ts: i64,
+    pub duration_ms: i64,
+    pub onset_ms: i64,
+    pub sound_end_ms: i64,
+    pub window_ms: (i64, i64),
+    pub peak_db: f32,
+    pub ambient_db: f32,
+    pub model: &'a str,
+    pub scores: &'a [f32],
+    pub embedding: &'a [f32],
+    pub patches: &'a [Vec<(String, f32)>],
+    pub top_sounds: &'a [(String, f32)],
+    pub decision: &'a classify::Decision,
+    pub candidates: &'a [(String, f32, i64)],
+    /// JSON of the settings in effect.
+    pub settings: &'a str,
+    pub classify_ms: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -158,6 +209,44 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
+    pub fn insert_classification(&self, c: &NewClassification) -> Result<i64> {
+        let d = c.decision;
+        let nearest_event = c.candidates.first().map(|(.., event)| *event);
+        self.conn.execute(
+            "INSERT INTO classifications (event_id, ts, duration_ms, onset_ms, sound_end_ms, window_start_ms,
+                 window_end_ms, peak_db, ambient_db, model, scores, embedding, patches, top_sounds, status, label,
+                 similarity, nearest_label, nearest_event, candidates, conflict, settings, classify_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+                 ?21, ?22, ?23)",
+            params![
+                c.event_id,
+                c.ts,
+                c.duration_ms,
+                c.onset_ms,
+                c.sound_end_ms,
+                c.window_ms.0,
+                c.window_ms.1,
+                c.peak_db,
+                c.ambient_db,
+                c.model,
+                to_blob(c.scores),
+                to_blob(c.embedding),
+                serde_json::to_string(c.patches)?,
+                serde_json::to_string(c.top_sounds)?,
+                serde_json::to_value(d.status)?.as_str(),
+                d.label,
+                d.nearest.as_ref().map(|n| n.1),
+                d.nearest.as_ref().map(|n| &n.0),
+                nearest_event,
+                serde_json::to_string(c.candidates)?,
+                d.conflict,
+                c.settings,
+                c.classify_ms,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
     /// Grows an event by one more clip that ends at `end_ts`. A pending event becomes a match
     /// when the new clip matched an exemplar with the same label.
     pub fn extend_event(&self, id: i64, end_ts: i64, peak_db: f32, matched: bool) -> Result<()> {
@@ -205,12 +294,17 @@ impl Store {
 
     pub fn exemplars(&self) -> Result<Vec<Exemplar>> {
         let mut stmt = self.conn.prepare(
-            "SELECT x.label, x.embedding, e.top_classes FROM exemplars x JOIN events e ON e.id = x.event_id",
+            "SELECT x.label, x.embedding, e.top_classes, x.event_id FROM exemplars x JOIN events e ON e.id = x.event_id",
         )?;
         let rows = stmt.query_map([], |r| {
             let top: Vec<(String, f32)> = serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default();
             let top_sound = classify::sounds(top).into_iter().next();
-            Ok(Exemplar { label: r.get(0)?, embedding: from_blob(&r.get::<_, Vec<u8>>(1)?), top_sound })
+            Ok(Exemplar {
+                event_id: r.get(3)?,
+                label: r.get(0)?,
+                embedding: from_blob(&r.get::<_, Vec<u8>>(1)?),
+                top_sound,
+            })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -350,6 +444,18 @@ fn event_from_row(r: &Row) -> rusqlite::Result<Event> {
         parts: r.get(12)?,
         conflict: r.get(13)?,
     })
+}
+
+/// (event, status, label, number of patches, number of class scores) of every classification, oldest first.
+#[cfg(test)]
+pub fn classifications(store: &Store) -> Vec<(Option<i64>, String, String, usize, usize)> {
+    let mut stmt =
+        store.conn.prepare("SELECT event_id, status, label, patches, scores FROM classifications ORDER BY id").unwrap();
+    let rows = stmt.query_map([], |r| {
+        let patches: Vec<serde_json::Value> = serde_json::from_str(&r.get::<_, String>(3)?).unwrap();
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, patches.len(), r.get::<_, Vec<u8>>(4)?.len() / 4))
+    });
+    rows.unwrap().map(Result::unwrap).collect()
 }
 
 pub fn now_ms() -> i64 {

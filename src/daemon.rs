@@ -4,11 +4,12 @@ use crate::capture::{self, Resampler};
 use crate::classify;
 use crate::config::{Config, Mode, Overrides};
 use crate::embed::{self, Tagger};
-use crate::store::{NewEvent, Store, now_ms};
+use crate::store::{NewClassification, NewEvent, Store, now_ms};
 use crate::trigger::{self, Event, FRAME, FRAME_MS, SAMPLE_RATE, Trigger};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -254,11 +255,18 @@ fn classify_loop(settings: &SharedSettings, store: Store, tagger: Tagger, clips:
 
 /// The part of the clip that is embedded: from just before the onset to the end of the sound,
 /// widened into the pre-roll, and then the tail, when that is shorter than one model patch.
-pub fn analysis_window(clip: &Clip) -> &[f32] {
+pub fn analysis_window(clip: &Clip) -> Range<usize> {
     let start = clip.onset.saturating_sub(ONSET_MARGIN_SAMPLES);
     let start = start.min(clip.sound_end.saturating_sub(embed::MIN_SAMPLES));
     let end = clip.sound_end.max((start + embed::MIN_SAMPLES).min(clip.samples.len()));
-    &clip.samples[start..end]
+    start..end
+}
+
+/// The settings a classification was made with, stored next to it.
+#[derive(Serialize)]
+struct SettingsInEffect<'a> {
+    trigger: &'a crate::config::Trigger,
+    classify: &'a crate::config::Classify,
 }
 
 /// The most recent event and when it ended, for grouping the next clip into it.
@@ -270,32 +278,72 @@ struct Latest {
 
 fn handle_clip(config: &Config, store: &Store, tagger: &Tagger, clip: &Clip, last: &mut Option<Latest>) -> Result<()> {
     let started = Instant::now();
-    let tags = tagger.tag(analysis_window(clip))?;
+    let window = analysis_window(clip);
+    let tags = tagger.tag(&clip.samples[window.clone()])?;
     let sounds = classify::sounds(tagger.top_classes(&tags.scores, 20));
     let top = &sounds[..sounds.len().min(3)];
     let c = &config.classify;
-    let decision = classify::decide(&tags.embedding, &store.exemplars()?, top, c);
-    if decision.status == classify::Status::Silent {
-        eprintln!("dropped a clip with nothing but silence or room tone");
-        return Ok(());
-    }
+    let exemplars = store.exemplars()?;
+    let decision = classify::decide(&tags.embedding, &exemplars, top, c);
+    let classify_ms = started.elapsed().as_millis() as i64;
     let ms = |samples: usize| samples as i64 * 1000 / SAMPLE_RATE as i64;
     let (onset_ts, end_ts) = (clip.ts + ms(clip.onset), clip.ts + ms(clip.samples.len()));
 
-    if decision.status == classify::Status::Ignored {
-        *last = None;
-    } else if let Some(prev) = *last
-        && c.group_gap_s > 0
-        && decision.conflict.is_none()
-        && onset_ts - prev.end_ts <= c.group_gap_s as i64 * 1000
-        && store.event(prev.id)?.is_some_and(|e| e.label == decision.label)
-    {
-        store.extend_event(prev.id, end_ts, clip.peak_db, decision.status == classify::Status::Match)?;
-        *last = Some(Latest { id: prev.id, end_ts });
-        eprintln!("event {}: extended with another {:?} clip", prev.id, decision.label);
-        return Ok(());
-    }
+    let event_id = 'event: {
+        if decision.status == classify::Status::Silent {
+            eprintln!("dropped a clip with nothing but silence or room tone");
+            break 'event None;
+        }
+        if decision.status == classify::Status::Ignored {
+            *last = None;
+        } else if let Some(prev) = *last
+            && c.group_gap_s > 0
+            && decision.conflict.is_none()
+            && onset_ts - prev.end_ts <= c.group_gap_s as i64 * 1000
+            && store.event(prev.id)?.is_some_and(|e| e.label == decision.label)
+        {
+            store.extend_event(prev.id, end_ts, clip.peak_db, decision.status == classify::Status::Match)?;
+            *last = Some(Latest { id: prev.id, end_ts });
+            eprintln!("event {}: extended with another {:?} clip", prev.id, decision.label);
+            break 'event Some(prev.id);
+        }
+        Some(new_event(store, clip, &decision, top, &tags.embedding, last, started)?)
+    };
 
+    store.insert_classification(&NewClassification {
+        event_id,
+        ts: clip.ts,
+        duration_ms: ms(clip.samples.len()),
+        onset_ms: ms(clip.onset),
+        sound_end_ms: ms(clip.sound_end),
+        window_ms: (ms(window.start), ms(window.end)),
+        peak_db: clip.peak_db,
+        ambient_db: clip.ambient_db,
+        model: embed::MODEL_NAME,
+        scores: &tags.scores,
+        embedding: &tags.embedding,
+        patches: &tags.patch_scores.iter().map(|p| tagger.top_classes(p, 5)).collect::<Vec<_>>(),
+        top_sounds: &sounds[..sounds.len().min(10)],
+        decision: &decision,
+        candidates: &classify::candidates(&tags.embedding, &exemplars, 5),
+        settings: &serde_json::to_string(&SettingsInEffect { trigger: &config.trigger, classify: c })?,
+        classify_ms,
+    })?;
+    Ok(())
+}
+
+/// Starts an event for a clip that is not grouped into the previous one, keeping its audio
+/// unless it is ignored.
+fn new_event(
+    store: &Store,
+    clip: &Clip,
+    decision: &classify::Decision,
+    top: &[(String, f32)],
+    embedding: &[f32],
+    last: &mut Option<Latest>,
+    started: Instant,
+) -> Result<i64> {
+    let end_ts = clip.ts + clip.samples.len() as i64 * 1000 / SAMPLE_RATE as i64;
     let clip_path = if decision.status == classify::Status::Ignored {
         None
     } else {
@@ -309,16 +357,16 @@ fn handle_clip(config: &Config, store: &Store, tagger: &Tagger, clip: &Clip, las
         duration_ms: end_ts - clip.ts,
         peak_db: clip.peak_db,
         ambient_db: clip.ambient_db,
-        decision: &decision,
+        decision,
         top_classes: top,
         clip_path: clip_path.as_deref(),
-        embedding: &tags.embedding,
+        embedding,
     })?;
     if decision.status != classify::Status::Ignored {
         *last = Some(Latest { id, end_ts });
     }
-    let nearest = decision.nearest.map(|(l, s)| format!(", nearest {l} {s:.2}")).unwrap_or_default();
-    let conflict = decision.conflict.map(|c| format!(", model hears {c}: asking")).unwrap_or_default();
+    let nearest = decision.nearest.as_ref().map(|(l, s)| format!(", nearest {l} {s:.2}")).unwrap_or_default();
+    let conflict = decision.conflict.as_ref().map(|c| format!(", model hears {c}: asking")).unwrap_or_default();
     eprintln!(
         "event {id}: {:?} {:?} ({}{nearest}{conflict}) in {} ms",
         decision.status,
@@ -326,7 +374,7 @@ fn handle_clip(config: &Config, store: &Store, tagger: &Tagger, clip: &Clip, las
         top.iter().map(|(n, s)| format!("{n} {s:.2}")).collect::<Vec<_>>().join(", "),
         started.elapsed().as_millis()
     );
-    Ok(())
+    Ok(id)
 }
 
 fn write_wav(path: &Path, samples: &[f32]) -> Result<()> {
@@ -369,9 +417,7 @@ mod tests {
     #[test]
     fn window_skips_the_tail() {
         let c = Clip { sound_end: PRE_ROLL + 40_000, ..clip(PRE_ROLL + 72_000, PRE_ROLL) };
-        let window = analysis_window(&c).as_ptr_range();
-        let samples = c.samples.as_ptr_range();
-        assert_eq!(window.end, samples.start.wrapping_add(PRE_ROLL + 40_000));
+        assert_eq!(analysis_window(&c).end, PRE_ROLL + 40_000);
     }
 
     #[test]
@@ -409,6 +455,31 @@ mod tests {
         }
         let events = store.events(&crate::store::Filter { limit: 10, ..Default::default() }).unwrap();
         assert_eq!(events.iter().map(|e| (e.parts, e.duration_ms)).collect::<Vec<_>>(), vec![(1, 2_500), (2, 7_000)]);
+        // every clip keeps its own classification, the grouped one included
+        let kept = crate::store::classifications(&store);
+        let (first, second) = (Some(events[1].id), Some(events[0].id));
+        assert_eq!(kept.iter().map(|k| k.0).collect::<Vec<_>>(), vec![first, first, second]);
+        assert!(kept.iter().all(|k| k.3 >= 1 && k.4 == 521), "patches and all class scores: {kept:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_silent_clip_makes_no_event_but_its_classification_is_kept() {
+        let dir = std::env::temp_dir().join(format!("creak-silent-{}", std::process::id()));
+        let mut config = Config::default();
+        config.storage.dir = dir.clone();
+        let store = Store::open(&dir).unwrap();
+        let tagger = Tagger::load().unwrap();
+        let quiet = vec![0.0; 40_000];
+        let clip =
+            Clip { samples: quiet, onset: 0, sound_end: 40_000, ts: 1_000_000, peak_db: -50.0, ambient_db: -60.0 };
+        handle_clip(&config, &store, &tagger, &clip, &mut None).unwrap();
+        assert!(store.events(&crate::store::Filter { limit: 10, ..Default::default() }).unwrap().is_empty());
+        let kept = crate::store::classifications(&store);
+        assert_eq!(
+            kept.iter().map(|k| (k.0, k.1.as_str(), k.2.as_str())).collect::<Vec<_>>(),
+            vec![(None, "silent", "")]
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

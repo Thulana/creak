@@ -28,6 +28,8 @@ const NOT_A_SOUND: &[&str] = &[
 ];
 
 pub struct Exemplar {
+    /// The event whose clip this exemplar is.
+    pub event_id: i64,
     pub label: String,
     /// L2-normalised.
     pub embedding: Vec<f32>,
@@ -98,6 +100,23 @@ pub fn decide(embedding: &[f32], exemplars: &[Exemplar], sounds: &[(String, f32)
     Decision { status, label, nearest: nearest.map(|(e, sim)| (e.label.clone(), sim)), conflict }
 }
 
+/// The best similarity of each label's exemplars to `embedding`, with the event of that
+/// exemplar, best first; at most `n`.
+pub fn candidates(embedding: &[f32], exemplars: &[Exemplar], n: usize) -> Vec<(String, f32, i64)> {
+    let mut best: Vec<(String, f32, i64)> = Vec::new();
+    for e in exemplars {
+        let sim = dot(embedding, &e.embedding);
+        match best.iter_mut().find(|(label, ..)| *label == e.label) {
+            Some(b) if sim > b.1 => (b.1, b.2) = (sim, e.event_id),
+            Some(_) => {}
+            None => best.push((e.label.clone(), sim, e.event_id)),
+        }
+    }
+    best.sort_by(|a, b| b.1.total_cmp(&a.1));
+    best.truncate(n);
+    best
+}
+
 /// Labels are free text: trimmed, lower-case, single spaces, at most 64 characters.
 pub fn normalize_label(raw: &str) -> Option<String> {
     let label = raw.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
@@ -109,7 +128,7 @@ mod tests {
     use super::*;
 
     fn ex(label: &str, v: [f32; 2]) -> Exemplar {
-        Exemplar { label: label.into(), embedding: v.to_vec(), top_sound: None }
+        Exemplar { event_id: 0, label: label.into(), embedding: v.to_vec(), top_sound: None }
     }
 
     fn heard_as(label: &str, v: [f32; 2], class: &str) -> Exemplar {
@@ -212,6 +231,18 @@ mod tests {
     fn a_suggested_label_carries_the_conflict() {
         let d = decide(&[1.0, 0.0], &[heard_as("bell", [0.7, 0.714], "Bell")], &[("Cough".into(), 0.5)]);
         assert_eq!((d.status, d.label.as_str(), d.conflict.as_deref()), (Status::Pending, "bell", Some("Cough")));
+    }
+
+    #[test]
+    fn candidates_keep_each_labels_best_exemplar() {
+        let exemplars = [
+            Exemplar { event_id: 1, ..ex("bell", [0.6, 0.8]) },
+            Exemplar { event_id: 2, ..ex("door", [0.8, 0.6]) },
+            Exemplar { event_id: 3, ..ex("bell", [1.0, 0.0]) },
+        ];
+        let c = candidates(&[1.0, 0.0], &exemplars, 5);
+        assert_eq!(c, vec![("bell".into(), 1.0, 3), ("door".into(), 0.8, 2)]);
+        assert_eq!(candidates(&[1.0, 0.0], &exemplars, 1).len(), 1);
     }
 
     #[test]
