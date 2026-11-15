@@ -42,6 +42,23 @@ Open that link from any device on your network. The token is stored in `/etc/cre
 
   A clip is asked about when no taught clip is close enough to tag it, or when one is close but the model is sure it hears a different sound than that label's taught clips. Everything else is tagged without asking.
 - **Events** is the full log, with the nearest learned sound and its similarity for every clip. A wrong match can be relabelled here.
+- **Settings** lists every threshold with what it does. A change applies at once, without a restart, and overrides the config file until you reset that setting (↺) or all of them.
+- **Active / deaf** is the switch at the top right. Deaf records nothing: no clips, no tags, no events, though the Live meter still moves. The mode survives a restart. To switch it from a script or Home Assistant, for example when everyone has left the house:
+
+  ```sh
+  curl -X POST -H "Authorization: Bearer <token>" -d '{"mode": "active"}' http://<host>:8377/api/mode
+  ```
+
+  ```yaml
+  # Home Assistant: call rest_command.creak_mode with mode: active or deaf
+  rest_command:
+    creak_mode:
+      url: http://<host>:8377/api/mode
+      method: post
+      headers:
+        Authorization: Bearer <token>
+      payload: '{"mode": "{{ mode }}"}'
+  ```
 
 One answer per sound is enough. A clip you confirm becomes an example; the next clip whose similarity to it is above `match_threshold` gets its label automatically. `ignore` works the same way, for sounds you never want to hear about again.
 
@@ -57,16 +74,21 @@ device = "default"        # or an id from `creak devices`
 
 [trigger]
 ratio = 3.0               # open when louder than ambient × ratio (about +9.5 dB)
-close_ratio = 1.5         # close when quieter than ambient × close_ratio …
+close_ratio = 1.5         # the sound is over when quieter than ambient × close_ratio …
 hang_ms = 800             # … for this long
+tail_ms = 2000            # keep recording this long after the sound; a sound in the tail joins the clip
 min_ms = 60               # ignore blips shorter than this
-max_clip_s = 15
+min_clip_s = 4            # every clip runs at least this long from its onset
+max_clip_s = 30
 cooldown_s = 2
+pre_roll_ms = 1500        # audio kept from before the onset
 ambient_floor_db = -60    # ambient is the 10th percentile of the last 5 minutes, never below this
 
 [classify]
 match_threshold = 0.85    # cosine similarity to a confirmed clip that applies its label; higher asks more often
 suggest_threshold = 0.60  # above this, the nearest label is proposed instead of the model's guess
+sound_score = 0.1         # the weakest model score that counts as a sound; a clip with none is dropped as silence
+conflict_score = 0.3      # how sure the model must be of another sound to send a match to review
 group_gap_s = 10          # a same-label clip within this many seconds extends the previous event; 0 = off
 
 [storage]
@@ -79,7 +101,7 @@ listen = "127.0.0.1:8377" # setup writes 0.0.0.0:8377 with a random token
 token = ""
 ```
 
-Restart after a change: `sudo systemctl restart creak`. Logs: `journalctl -u creak -f`.
+Everything in `[trigger]` and `[classify]`, and `retention_days`, can also be changed on the Settings page, which applies the change at once and overrides this file until reset. A change to the file itself needs a restart: `sudo systemctl restart creak`. Logs: `journalctl -u creak -f`.
 
 The web UI is meant for a home network or a VPN. Do not expose it to the internet.
 

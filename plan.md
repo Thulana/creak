@@ -56,20 +56,23 @@ mic ─▶ capture ─▶ level meter ─▶ trigger ─▶ clip (WAV) ─▶ em
 - **Ambient** is the 10th percentile of frame levels over the trailing 5 minutes, with a configurable minimum.
 - **Open** when the level stays above `ambient × ratio` for `min_ms`. Default ratio 3 (about +9.5 dB).
 - **Close** when the level stays below `ambient × close_ratio` for `hang_ms`.
-- The clip includes 1.5 s of pre-roll from the ring buffer and is cut at `max_clip_s` (default 15 s).
+- The clip includes `pre_roll_ms` (1.5 s) of pre-roll from the ring buffer.
+- **Tail.** After the close, recording goes on for `tail_ms` (2 s). A sound that crosses the open line during the tail reopens the same clip instead of starting a new one after the cooldown.
+- Every clip runs at least `min_clip_s` (4 s) from its onset, so a click or a knock comes with what followed it, and is cut at `max_clip_s` (30 s). Pre-roll, tail and this padding are for listening; only onset to close is embedded (§3.2).
 - A cooldown stops one long noise from producing a storm of events.
+- **Modes.** `active` records. `deaf` keeps measuring the level and the ambient but opens no clip, and drops one being recorded. The mode is stored in the database and switched from the web UI header or `POST /api/mode` (later also `creak/mode/set`, §3.6), so an automation can make creak listen only while nobody is home.
 - **Grouping.** A clip whose label equals the previous event's, and that starts within `group_gap_s` (default 10 s) of that event's end, extends the event instead of creating a new one: its duration grows and its clip count goes up, and only the first clip's audio is kept. Continuous music becomes one event, not one every 17 s.
 
 ### 3.2 Tagging
 
 The model always answers first; the user is only asked to check.
 
-1. Take the active part of the clip (from the trigger opening to its close, at least ~1 s, widened into the pre-roll if shorter). The pre-roll stays in the WAV for listening but is not embedded, so room ambient does not dominate the embedding.
+1. Take the active part of the clip (from the trigger opening to its close, at least ~1 s, widened into the pre-roll if shorter). The pre-roll and the tail stay in the WAV for listening but are not embedded, so room ambient does not dominate the embedding.
 2. Run the model on it in 0.96 s patches with a 0.48 s hop. It returns AudioSet class scores and an embedding per patch; mean-pool both and L2-normalise the embedding.
-3. Take the model's view without the classes that are not a sound: Silence, the room and outdoor ambience classes, reverberation, echo and the noise classes. These are never proposed or shown. The best remaining class is the model's guess if it scores at least 0.1.
+3. Take the model's view without the classes that are not a sound: Silence, the room and outdoor ambience classes, reverberation, echo and the noise classes. These are never proposed or shown. The best remaining class is the model's guess if it scores at least `sound_score` (0.1).
 4. Find the nearest confirmed exemplar by cosine similarity (brute force is fine for thousands).
 5. Result, in this order:
-   - **conflict → pending**: the nearest exemplar is above `match_threshold`, but the model is sure (score ≥ 0.3) of a sound that none of that label's exemplars was heard as. The clip goes to review as "Music? · the model hears Cough" instead of being matched. Confirming it adds that class to the label's exemplars, so the same pair is not asked about again. The same holds for `ignore`, so ignoring typing does not swallow a cough. A conflicting clip is never grouped into the previous event.
+   - **conflict → pending**: the nearest exemplar is above `match_threshold`, but the model is sure (score ≥ `conflict_score`, 0.3) of a sound that none of that label's exemplars was heard as. The clip goes to review as "Music? · the model hears Cough" instead of being matched. Confirming it adds that class to the label's exemplars, so the same pair is not asked about again. The same holds for `ignore`, so ignoring typing does not swallow a cough. A conflicting clip is never grouped into the previous event.
    - **ignored**: the nearest exemplar is above `match_threshold` and carries the reserved label `ignore`. The event row is kept, the clip is not.
    - **match**: the nearest exemplar is above `match_threshold`. The clip takes that exemplar's label and is published at once. Nobody is asked.
    - **dropped**: the model has no guess, so it heard nothing but silence or room tone. Nothing is stored: no row, no clip, no question. Silence is never an event and `silence` is not accepted as a label.
@@ -112,6 +115,8 @@ Scenes last for minutes or hours, so the trigger is the wrong tool: the ambient 
 | `creak/scene/<label>` | `ON` / `OFF`, retained |
 | `creak/ambient` | ambient level in dBFS, once a minute |
 | `creak/label/set` | inbound `{id, label}`, so an HA notification action can confirm a tag |
+| `creak/mode` | `active` / `deaf`, retained |
+| `creak/mode/set` | inbound `active` / `deaf`, so a presence automation can switch it |
 
 HA discovery creates one `event` entity (event types are your labels), one `binary_sensor` per scene and one `sensor` for the ambient level.
 
@@ -124,7 +129,10 @@ Turned on or off with `[web] enabled`. With it off, the daemon, the CLI and MQTT
 | **Review** | The pending queue, newest first. Each clip has a play button, the proposed label as a question ("Door?"), the model's top classes, and confirm / correct / ignore. Keyboard shortcuts for all four, so a queue clears quickly. |
 | **Events** | The event log, filtered by label and status. Every row plays its clip, shows the nearest exemplar and similarity, and can be relabelled. |
 | **Labels** | Exemplar count per label, and how often its matches were corrected. Rename, delete, switch between `event` and `scene`. |
-| **Live** | Current level, measured ambient and the trigger lines, for checking the microphone. Sliders for `ratio`, `close_ratio` and `ambient_floor_db` apply at once; they are stored in the database and override the config file until reset. |
+| **Live** | Current level, measured ambient and the trigger lines, for checking the microphone. Sliders for `ratio`, `close_ratio` and `ambient_floor_db`, the three settings worth changing while watching the meter. |
+| **Settings** | Every setting under `[trigger]` and `[classify]`, and `retention_days`, with its range and what it does. A change applies while the daemon runs and is stored in the database as an override of the config file until reset. The ranges live in `config.rs` and apply to the config file too. Device, listen address, token and data directory need a restart, so they stay in the file. |
+
+The header carries the active/deaf switch (§3.1).
 
 - One static HTML file with plain JavaScript, embedded in the binary. No build step, no framework.
 - It talks to a small JSON API on the same port; clips are served as WAV with range requests, so every browser's own audio player works.
@@ -186,13 +194,18 @@ ratio = 3.0
 close_ratio = 1.5
 min_ms = 60
 hang_ms = 800
-max_clip_s = 15
+tail_ms = 2000
+min_clip_s = 4
+max_clip_s = 30
 cooldown_s = 2
+pre_roll_ms = 1500
 ambient_floor_db = -60
 
 [classify]
 match_threshold = 0.85
 suggest_threshold = 0.60
+sound_score = 0.1
+conflict_score = 0.3
 group_gap_s = 10
 publish_pending = false
 
@@ -250,7 +263,7 @@ Phase 0 replaces a separate offline spike: the questions it was meant to answer 
 | 0 | **Minimal deployable version** | `devices`, `run`, `events`, `label`, `setup`, `uninstall`. Capture, trigger, clips, YAMNet tagging, exemplar matching, retention by age. Web UI with Review, Events and Live. Release workflow for Linux x86_64 and aarch64, `install.sh`. | A fresh Ubuntu 24.04 machine or container goes from the one-liner to a running service and prints the UI URL; re-running it upgrades and keeps the config. The Live view moves with the room and clips sound right. A clap gives exactly one clip with pre-roll. Rust log-mel and embeddings match the TensorFlow reference on the fixture. After a few days with ~4 real sounds confirmed once each: the model's own top class is a sensible first guess for most clips, and there is a `match_threshold` where wrong matches stay under 5 % and at least half of the same-sound clips match from one exemplar. Model and thresholds are written into this plan. |
 | 1 | **Accuracy** | §3.8: Audit mode, `creak eval`, the match check sample; conflict display, Skip and correct-to-cause in Review; candidate matching changes tried one at a time through the replay. | On at least 50 audited clips, the replay reports the wrong-tag rate and question count for the current policy, and every change kept lowers wrong tags without raising questions by more than a quarter. A cough over background music is tagged as a cough. |
 | 2 | **Complete the core** | `calibrate`, `review`, `labels`, `doctor`. Labels view (rename, delete, corrected-match rate). Retention by size. 24 h soak. | No event storm and flat memory over 24 h. A wrong match corrected in the event log does not repeat. With `[web] enabled = false` the daemon still runs and `creak label` still works. |
-| 3 | **MQTT and Home Assistant** | Publishing, discovery, `label/set`. | Entities appear in HA without YAML. An automation fires on a matched event. An HA notification action confirms a tag. |
+| 3 | **MQTT and Home Assistant** | Publishing, discovery, `label/set`, `mode/set`. | Entities appear in HA without YAML. An automation fires on a matched event. An HA notification action confirms a tag. |
 | 4 | **Scenes** | `labels` table, `teach`, the one-minute sampler, scene state. | A movie is taught once; the next evening the scene turns on within 5 minutes and off within 5 minutes of the end. |
 | 5 | **LLM first guess, optional** | For clips with no close exemplar, ask an OpenAI-compatible endpoint with audio input for the proposed label, in place of the AudioSet class. Off by default. | Only build this if the model's own first guesses are too generic to be useful after Phase 1. |
 | 6 | **macOS and Windows** | Release builds for both. `setup` / `uninstall` install a launchd agent on macOS and a Windows service; platform default paths for config and data. Install via a script or a package manager. | On each OS: install, the Live view moves, a clap gives one clip, uninstall leaves nothing behind except data. |
