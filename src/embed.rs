@@ -23,9 +23,6 @@ const PATCH_HOP_FRAMES: usize = 48; // 0.48 s
 /// Shortest waveform that yields one patch: 0.96 s + 25 ms window − 10 ms hop.
 pub const MIN_SAMPLES: usize = 15_600;
 const PATCH_HOP_SAMPLES: usize = PATCH_HOP_FRAMES * HOP;
-/// Patches quieter than the loudest one by more than this are left out of the pooled result,
-/// so the room around a short sound does not drown it.
-const LOUD_PATCH_RANGE_DB: f32 = 10.0;
 
 /// Per-patch class scores and embeddings.
 type PatchOutputs = (Vec<Vec<f32>>, Vec<Vec<f32>>);
@@ -76,17 +73,14 @@ impl Tagger {
         order.into_iter().take(n).map(|i| (self.class_name(i).to_string(), scores[i])).collect()
     }
 
-    /// Scores and embedding of the loud part of `wave`: the mean over its loudest patches.
     pub fn tag(&self, wave: &[f32]) -> Result<Tags> {
-        let padded = pad(wave);
-        let (scores, embeddings) = self.run_patches(&self.log_mel(&padded))?;
-        let keep = loud_patches(&padded, scores.len());
+        let (scores, embeddings) = self.run_patches(&self.log_mel(&pad(wave)))?;
         let mean = |rows: &[Vec<f32>]| {
             let mut sum = vec![0.0; rows[0].len()];
-            for &i in &keep {
-                sum.iter_mut().zip(&rows[i]).for_each(|(s, v)| *s += v);
+            for row in rows {
+                sum.iter_mut().zip(row).for_each(|(s, v)| *s += v);
             }
-            sum.iter_mut().for_each(|s| *s /= keep.len() as f32);
+            sum.iter_mut().for_each(|s| *s /= rows.len() as f32);
             sum
         };
         let mut embedding = mean(&embeddings);
@@ -132,15 +126,6 @@ impl Tagger {
             })
             .collect()
     }
-}
-
-/// Indices of the patches within `LOUD_PATCH_RANGE_DB` of the loudest one.
-fn loud_patches(padded: &[f32], patches: usize) -> Vec<usize> {
-    let levels: Vec<f32> = (0..patches)
-        .map(|i| crate::trigger::level_db(&padded[i * PATCH_HOP_SAMPLES..i * PATCH_HOP_SAMPLES + MIN_SAMPLES]))
-        .collect();
-    let loudest = levels.iter().copied().fold(f32::MIN, f32::max);
-    (0..patches).filter(|&i| levels[i] >= loudest - LOUD_PATCH_RANGE_DB).collect()
 }
 
 /// Zero-pads to at least one patch and then to a whole number of patch hops, as YAMNet does.
@@ -223,19 +208,6 @@ mod tests {
     fn padding_matches_yamnet() {
         assert_eq!(pad(&[0.0; 100]).len(), MIN_SAMPLES);
         assert_eq!(pad(&[0.0; MIN_SAMPLES + 1]).len(), MIN_SAMPLES + PATCH_HOP_SAMPLES);
-    }
-
-    #[test]
-    fn quiet_surroundings_do_not_dilute_the_sound() {
-        let tagger = Tagger::load().unwrap();
-        let (sound, _) = fixture();
-        let quiet = vec![0.0005f32; 16_000 * 4];
-        let surrounded = [quiet.clone(), sound.clone(), quiet].concat();
-        let alone = tagger.tag(&sound).unwrap();
-        let within = tagger.tag(&surrounded).unwrap();
-        let cosine = crate::classify::dot(&alone.embedding, &within.embedding);
-        assert!(cosine > 0.9, "cosine {cosine}");
-        assert_ne!(tagger.top_classes(&within.scores, 1)[0].0, "Silence");
     }
 
     #[test]
