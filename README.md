@@ -47,6 +47,7 @@ Open that link from any device on your network. The token is stored in `/etc/cre
   A few clips that were tagged without asking come back as "Door, right?": every one below 0.9 similarity and one in ten above. Answer right (`Y`), correct it, or can't tell (`S`). The answers give a running precision per label, shown in the Audit view.
 - **Events** is the full log, with the nearest learned sound and its similarity for every clip. A wrong match can be relabelled here. Correcting a clip that was tagged without asking shows the taught clip that caused it, so you can relabel or remove that one too; otherwise the same mistake comes back.
 - **Audit** plays random clips without saying what creak thinks they are, and asks you what each one is. These answers never teach creak. They are the test set for `creak eval`, which scores creak on labels it did not suggest: 50–100 audited clips across your common sounds make a first one. Audited clips are kept like taught ones.
+- **Labels** lists everything creak has been taught: how many taught clips each label has, how many clips were tagged with it without asking, and how many of those you corrected later. Rename a label here; renaming it to another label's name merges the two. Deleting a label stops its taught clips being examples, so nothing is tagged with it any more; past events keep it.
 - **Settings** lists every threshold with what it does. A change applies at once, without a restart, and overrides the config file until you reset that setting (↺) or all of them.
 - **Active / deaf** is the switch at the top right. Deaf records nothing: no clips, no tags, no events, though the Live meter still moves. The mode survives a restart. To switch it from a script or Home Assistant, for example when everyone has left the house:
 
@@ -93,8 +94,8 @@ close_ratio = 1.5         # the sound is over when quieter than ambient × close
 hang_ms = 800             # … for this long
 tail_ms = 2000            # keep recording this long after the sound; a sound in the tail joins the clip
 min_ms = 60               # ignore blips shorter than this
-min_clip_s = 4            # every clip runs at least this long from its onset
-max_clip_s = 30
+min_clip_s = 15           # every clip runs at least this long from its onset; a sound in that time joins it
+max_clip_s = 60
 cooldown_s = 2
 pre_roll_ms = 1500        # audio kept from before the onset
 ambient_floor_db = -60    # ambient is the 10th percentile of the last 5 minutes, never below this
@@ -127,14 +128,22 @@ The web UI is meant for a home network or a VPN. Do not expose it to the interne
 creak devices                       list capture devices
 creak run [--config FILE]           run the daemon in the foreground
 creak events [--since 1d] [--label door] [--status pending] [--json]
+creak review                        what waits for an answer, and the web UI address
 creak label <event-id> <label>      confirm or correct; `ignore` to stop keeping clips like it
 creak skip <event-id>               answer without teaching; also removes a taught clip
+creak labels                        taught labels, with how often their automatic tags were corrected
+creak labels rename <label> <new>   rename everywhere; another label's name merges the two
+creak labels delete <label>         stop tagging with it; past events keep it
 creak eval                          score tagging against your audited clips
+creak calibrate [--device ID]       live meter in the terminal: level, ambient, the line to cross
+creak doctor                        check config, disk, model, service, web UI and microphone
 sudo creak setup                    install or upgrade the service
 sudo creak uninstall [--purge]
 ```
 
-The database belongs to the `creak` user, so run `events`, `label`, `skip` and `eval` as `sudo -u creak creak …`.
+The database belongs to the `creak` user, so run everything but `devices`, `setup` and `uninstall` as `sudo -u creak creak …`.
+
+Without the web UI (`[web] enabled = false`), `creak review` lists the clips waiting with their file paths; confirm one with `creak label <id>` and the same label. `creak calibrate` opens the microphone itself, so stop the service first if the device cannot be shared. When something seems wrong, start with `sudo -u creak creak doctor`.
 
 ## Running in a container
 

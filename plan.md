@@ -1,6 +1,6 @@
 # creak — implementation plan
 
-_Written 2026-11-15. Status: Phase 0 (minimal deployable version) shipped as v0.1.0. Its wrong-match target was missed (2 of 29 at 0.85, from mislabelled exemplars) and moves into Phase 1's check. Phase 1 (accuracy) is built; its check waits on 50 audited clips from the installation._
+_Written 2026-11-15. Status: Phase 0 (minimal deployable version) shipped as v0.1.0. Its wrong-match target was missed (2 of 29 at 0.85, from mislabelled exemplars) and moves into Phase 1's check. Phase 1 (accuracy) is built; its check waits on 50 audited clips from the installation. Phase 2 (complete the core) is built during that wait, since it does not depend on the audit; its check needs a 24 h soak on the installation._
 
 `creak` is a single-binary daemon that listens to one microphone all the time, cuts a clip whenever the sound rises above `n ×` the ambient level, lets a model tag the clip (door, doorbell, party, movie…), logs it, and publishes it to Home Assistant over MQTT. It then asks you whether the tag is right. A confirmation is usually enough: from then on, anything that sounds like that clip is tagged and published without asking, unless the model hears something that contradicts the label (§3.2).
 
@@ -58,10 +58,10 @@ mic ─▶ capture ─▶ level meter ─▶ trigger ─▶ clip (WAV) ─▶ em
 - **Close** when the level stays below `ambient × close_ratio` for `hang_ms`.
 - The clip includes `pre_roll_ms` (1.5 s) of pre-roll from the ring buffer.
 - **Tail.** After the close, recording goes on for `tail_ms` (2 s). A sound that crosses the open line during the tail reopens the same clip instead of starting a new one after the cooldown.
-- Every clip runs at least `min_clip_s` (4 s) from its onset, so a click or a knock comes with what followed it, and is cut at `max_clip_s` (30 s). Pre-roll, tail and this padding are for listening; only onset to close is embedded (§3.2).
+- Every clip runs at least `min_clip_s` (15 s) from its onset, so a click or a knock comes with what followed it, and is cut at `max_clip_s` (60 s). A sound during this padding joins the clip, as in the tail. Pre-roll, tail and padding are for listening; only onset to close is embedded (§3.2).
 - A cooldown stops one long noise from producing a storm of events.
 - **Modes.** `active` records. `deaf` keeps measuring the level and the ambient but opens no clip, and drops one being recorded. The mode is stored in the database and switched from the web UI header or `POST /api/mode` (later also `creak/mode/set`, §3.6), so an automation can make creak listen only while nobody is home.
-- **Grouping.** A clip whose label equals the previous event's, and that starts within `group_gap_s` (default 10 s) of that event's end, extends the event instead of creating a new one: its duration grows and its clip count goes up, and only the first clip's audio is kept. Continuous music becomes one event, not one every 17 s.
+- **Grouping.** A clip whose label equals the previous event's, and that starts within `group_gap_s` (default 10 s) of that event's end, extends the event instead of creating a new one: its duration grows and its clip count goes up, and only the first clip's audio is kept. Continuous music becomes one event, not one a minute.
 
 ### 3.2 Tagging
 
@@ -154,7 +154,7 @@ Turned on or off with `[web] enabled`. With it off, the daemon, the CLI and MQTT
 | **Review** | The pending queue and the matches due for a check, newest first. Each clip has a play button, the proposed label as a question ("Door?") or a check ("Door, right?"), its sound mix, and confirm / correct / skip / ignore. Keyboard shortcuts for all of them, so a queue clears quickly. |
 | **Events** | The event log, filtered by label and status. Every row plays its clip, shows the nearest exemplar, similarity and sound mix, and can be relabelled. Relabelling a match shows the exemplar that caused it. |
 | **Audit** | A random clip with nothing about what creak thinks it is; you say what it is, or that you can't tell. Shows the running precision of automatic tags from the match checks (§3.8). |
-| **Labels** | Exemplar count per label, and how often its matches were corrected. Rename, delete, switch between `event` and `scene`. |
+| **Labels** | Exemplar count per label, and how often its matches were corrected. Rename (onto another label merges the two), delete (its exemplars stop being examples; events keep the label), and from Phase 4 switch between `event` and `scene`. |
 | **Live** | Current level, measured ambient and the trigger lines, for checking the microphone. Sliders for `ratio`, `close_ratio` and `ambient_floor_db`, the three settings worth changing while watching the meter. |
 | **Settings** | Every setting under `[trigger]` and `[classify]`, and `retention_days` and `max_mb`, with its range and what it does. A change applies while the daemon runs and is stored in the database as an override of the config file until reset. The ranges live in `config.rs` and apply to the config file too. Device, listen address, token and data directory need a restart, so they stay in the file. |
 
@@ -195,7 +195,7 @@ Already measured on Phase 0 data and rejected: embedding only the loudest patche
 ```
 creak setup                     # root: user, dirs, default config, systemd unit
 creak devices                   # list capture devices
-creak calibrate                 # live meter: level, ambient, trigger line
+creak calibrate [--device <id>] # live meter: level, ambient, trigger line
 creak run                       # the daemon; systemd runs this
 creak events [--since 1d] [--label door] [--json]
 creak review                    # pending count, and the web UI URL if it is enabled
@@ -203,8 +203,9 @@ creak label <event-id> <label|ignore>
 creak skip <event-id>           # answer without teaching; removes an exemplar
 creak eval                      # replay the audited clips (§3.8)
 creak labels                    # exemplar count and corrected-match rate per label
+creak labels rename <label> <new> | delete <label>
 creak teach <scene> --for 10m
-creak doctor                    # checks mic, model, MQTT, disk
+creak doctor                    # checks config, disk, model, service, web UI, mic; MQTT from Phase 3
 creak uninstall [--purge]
 ```
 
@@ -224,8 +225,8 @@ close_ratio = 1.5
 min_ms = 60
 hang_ms = 800
 tail_ms = 2000
-min_clip_s = 4
-max_clip_s = 30
+min_clip_s = 15
+max_clip_s = 60
 cooldown_s = 2
 pre_roll_ms = 1500
 ambient_floor_db = -60
@@ -276,7 +277,8 @@ creak/
 │   ├── daemon.rs      # wires capture → trigger → classify → store
 │   ├── web.rs         # web UI and its JSON API
 │   ├── mqtt.rs        # publish, discovery, label/set
-│   └── setup.rs       # setup, uninstall, doctor; the platform-specific part
+│   ├── doctor.rs      # creak doctor
+│   └── setup.rs       # setup, uninstall, service status, free space; the platform-specific part
 ├── ui/index.html      # one page, embedded in the binary
 ├── tests/fixtures/    # short WAVs and the TensorFlow reference output
 └── .github/workflows/ # ci.yml, release.yml
@@ -292,7 +294,7 @@ Phase 0 replaces a separate offline spike: the questions it was meant to answer 
 |---|---|---|---|
 | 0 | **Minimal deployable version** | `devices`, `run`, `events`, `label`, `setup`, `uninstall`. Capture, trigger, clips, YAMNet tagging, exemplar matching, retention by age. Web UI with Review, Events and Live. Release workflow for Linux x86_64 and aarch64, `install.sh`. | A fresh Ubuntu 24.04 machine or container goes from the one-liner to a running service and prints the UI URL; re-running it upgrades and keeps the config. The Live view moves with the room and clips sound right. A clap gives exactly one clip with pre-roll. Rust log-mel and embeddings match the TensorFlow reference on the fixture. After a few days with ~4 real sounds confirmed once each: the model's own top class is a sensible first guess for most clips, and there is a `match_threshold` where wrong matches stay under 5 % and at least half of the same-sound clips match from one exemplar. Model and thresholds are written into this plan. |
 | 1 | **Accuracy** | §3.8: Audit mode, `creak eval`, the match check sample; conflict display, Skip and correct-to-cause in Review; the sound mix of a clip and its foreground (§3.4, layer 1); candidate matching changes tried one at a time through the replay. | On at least 50 audited clips, the replay reports the wrong-tag rate and question count for the current policy, and every change kept lowers wrong tags without raising questions by more than a quarter. A cough over background music is tagged as a cough. |
-| 2 | **Complete the core** | `calibrate`, `review`, `labels`, `doctor`. Labels view (rename, delete, corrected-match rate). 24 h soak. | No event storm and flat memory over 24 h. A wrong match corrected in the event log does not repeat. With `[web] enabled = false` the daemon still runs and `creak label` still works. |
+| 2 | **Complete the core** | `calibrate`, `review`, `labels`, `doctor`. Labels view (rename, delete, corrected-match rate). 24 h soak. | No event storm and flat memory over 24 h (`creak doctor` shows the daemon's memory and the events of the last 24 h). A wrong match corrected in the event log does not repeat. With `[web] enabled = false` the daemon still runs and `creak label` still works. |
 | 3 | **MQTT and Home Assistant** | Publishing, discovery, `label/set`, `mode/set`. | Entities appear in HA without YAML. An automation fires on a matched event. An HA notification action confirms a tag. |
 | 4 | **Scenes** | §3.4 layers 2 and 3: `labels` table, the scene sampler, the rule table, scene cards in Review, `teach`, scene state, the `scene` column on events. | A party is proposed by the rule table the first time it happens. A movie is taught once; the next evening the scene turns on within 5 minutes and off within 5 minutes of the end. |
 | 5 | **LLM first guess, optional** | For clips with no close exemplar, ask an OpenAI-compatible endpoint with audio input for the proposed label, in place of the AudioSet class. Off by default. | Only build this if the model's own first guesses are too generic to be useful after Phase 1. |
@@ -342,6 +344,6 @@ CREAK_VERSION=v0.1.0 sh install.sh
 
 1. **Microphones with built-in processing.** Array microphones that apply voice-tuned noise suppression before the OS sees the signal may flatten the sounds this tool is for. Phase 0's first clips show it; a plain USB microphone is the fallback.
 2. **Doors and windows in other rooms.** One microphone hears a distant window poorly, and a contact sensor is more reliable for those. Expect the best results on sounds with no sensor: doorbell, appliances, alarms, party, movie.
-3. **Short sounds inside longer clips.** A cough over typing or music is recorded but takes the clip's dominant label. Pooling only the loudest patches made matching worse (§3.8). The foreground of the sound mix (§3.4) now proposes the cough when the music was already playing before it; a cough that starts the clip, with typing joining in the tail, still needs splitting at onsets.
+3. **Short sounds inside longer clips.** A cough over typing or music is recorded but takes the clip's dominant label. Pooling only the loudest patches made matching worse (§3.8). The foreground of the sound mix (§3.4) now proposes the cough when the music was already playing before it; a cough that starts the clip, with typing joining in the tail, still needs splitting at onsets. Clips of at least 15 s, up from 4 s, make this more common: any sound within 15 s of the first joins its clip.
 4. **Rust.** Chosen for the single binary. The Python alternative would be a `uv tool install` package, with the same design and a heavier install.
 5. **Why not an existing tool.** bark-detector, ha-audio-events, sound-sensor-homeassistant, AudioClassifier-MQTT, Yamcam, Heyra and Frigate all classify into YAMNet's fixed labels. None learns your own sounds or has a confirm loop, and none uses an ambient-relative trigger. bark-detector's clip log and MQTT discovery are worth reading before Phases 2 and 3.
