@@ -3,6 +3,7 @@ mod classify;
 mod config;
 mod daemon;
 mod embed;
+mod eval;
 mod setup;
 mod store;
 mod trigger;
@@ -38,7 +39,7 @@ enum Command {
         since: Option<String>,
         #[arg(long)]
         label: Option<String>,
-        /// match, pending, ignored, confirmed or corrected.
+        /// match, pending, ignored, confirmed, corrected or skipped.
         #[arg(long)]
         status: Option<String>,
         #[arg(long, default_value_t = 50)]
@@ -48,6 +49,10 @@ enum Command {
     },
     /// Confirm or correct an event's label; use `ignore` to stop keeping clips like it.
     Label { id: i64, label: String },
+    /// Answer an event without teaching: it is no longer asked about and stops being an example.
+    Skip { id: i64 },
+    /// Score tagging against the clips you audited, and compare candidate matching changes.
+    Eval,
     /// Stop and remove the service; keeps config and data unless --purge (root).
     Uninstall {
         #[arg(long)]
@@ -71,6 +76,7 @@ fn main() -> Result<()> {
                 since_ms,
                 before_id: None,
                 hide_ignored: false,
+                review: false,
                 limit,
             })?;
             if json {
@@ -84,9 +90,23 @@ fn main() -> Result<()> {
         }
         Command::Label { id, label } => {
             let mut store = open_store(&cli.config)?;
-            print_event(&store.label_event(id, &label)?, store.dir());
+            let labelled = store.label_event(id, &label)?;
+            print_event(&labelled.event, store.dir());
+            if let Some(cause) = labelled.cause {
+                println!(
+                    "It had been tagged automatically because of event {0}, taught as {1:?}. \
+                     `creak label {0} <label>` relabels that example; `creak skip {0}` removes it.",
+                    cause.id, cause.label
+                );
+            }
             Ok(())
         }
+        Command::Skip { id } => {
+            let store = open_store(&cli.config)?;
+            print_event(&store.skip_event(id)?, store.dir());
+            Ok(())
+        }
+        Command::Eval => eval::run(&config::Config::load(&cli.config)?),
     }
 }
 
