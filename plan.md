@@ -69,10 +69,11 @@ The model always answers first; the user is only asked to check.
 3. Take the model's view without the classes that are not a sound: Silence, the room and outdoor ambience classes, reverberation, echo and the noise classes. These are never proposed or shown. The best remaining class is the model's guess if it scores at least 0.1.
 4. Find the nearest confirmed exemplar by cosine similarity (brute force is fine for thousands).
 5. Result, in this order:
+   - **conflict → pending**: the nearest exemplar is above `match_threshold`, but the model is sure (score ≥ 0.3) of a sound that none of that label's exemplars was heard as. The clip goes to review as "Music? · the model hears Cough" instead of being matched. Confirming it adds that class to the label's exemplars, so the same pair is not asked about again. The same holds for `ignore`, so ignoring typing does not swallow a cough. A conflicting clip is never grouped into the previous event.
    - **ignored**: the nearest exemplar is above `match_threshold` and carries the reserved label `ignore`. The event row is kept, the clip is not.
    - **match**: the nearest exemplar is above `match_threshold`. The clip takes that exemplar's label and is published at once. Nobody is asked.
    - **dropped**: the model has no guess, so it heard nothing but silence or room tone. Nothing is stored: no row, no clip, no question. Silence is never an event and `silence` is not accepted as a label.
-   - **pending**: the clip gets a proposed label and goes to the review queue as a question ("Door?"). The proposal is the nearest exemplar's label if it is above `suggest_threshold`, otherwise the model's guess.
+   - **pending**: the clip gets a proposed label and goes to the review queue as a question ("Door?"). The proposal is the nearest exemplar's label if it is above `suggest_threshold`, otherwise the model's guess. A nearest-exemplar proposal carries the same conflict note when the model disagrees with it.
 
 On day one there are no exemplars, so every clip is pending with the model's own guess. Every event records its nearest exemplar and similarity, even below the thresholds, so the thresholds can be tuned from real data.
 
@@ -141,14 +142,13 @@ One confirmation is enough only if confirmations are right. Phase 0 showed they 
 
 **Protecting the exemplars**
 
-- Review shows the model's view next to the proposal and flags a conflict ("Music? · the model hears Cough"), with the model's class as its own one-key answer.
+- Review shows the model's view next to the proposal and flags a conflict ("Music? · the model hears Cough"), with the model's class as its own one-key answer. In place since Phase 0, together with the conflict rule in §3.2.
 - **Skip** answers a clip without creating an exemplar, for mixed or unclear clips. Today every answer creates one.
 - Correcting an automatic match shows the exemplar that caused it, with relabel or remove, so the cause is fixed rather than outvoted.
 
 **Candidate matching changes**, each kept only if the replay shows fewer wrong tags without many more questions:
 
 - A margin: tag automatically only when the best label beats the best other label by a margin.
-- Model consistency: an automatic match also needs the clip's model class to have been seen among that label's exemplars.
 - Centred embeddings: subtract the mean embedding of recent clips before comparing. YAMNet embeddings share a large common component, so unrelated sounds sit near 0.45 and the useful range is narrow.
 - Clean exemplars: a clip whose patches disagree is a poor exemplar; ask, or keep only the matching part.
 - Splitting a clip at a sharp new onset (a cough over typing), with the split clip embedded from around its onset, and grouping stitching continuous sounds back together.

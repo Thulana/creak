@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS events (
     top_classes   TEXT    NOT NULL,   -- JSON [[class, score], ...] from the model
     clip_path     TEXT,               -- relative to the storage dir; NULL once dropped
     embedding     BLOB    NOT NULL,   -- empty once the clip has expired
-    parts         INTEGER NOT NULL DEFAULT 1  -- clips grouped into this event; only the first is kept
+    parts         INTEGER NOT NULL DEFAULT 1, -- clips grouped into this event; only the first is kept
+    conflict      TEXT                -- the model's class when it contradicted the label and the clip went to review
 );
 CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
 CREATE TABLE IF NOT EXISTS exemplars (
@@ -70,6 +71,7 @@ pub struct Event {
     pub clip_path: Option<String>,
     pub exemplar: bool,
     pub parts: i64,
+    pub conflict: Option<String>,
 }
 
 #[derive(Default)]
@@ -96,10 +98,14 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
-        let has_parts: bool =
-            conn.query_row("SELECT COUNT(*) FROM pragma_table_info('events') WHERE name = 'parts'", [], |r| r.get(0))?;
-        if !has_parts {
-            conn.execute_batch("ALTER TABLE events ADD COLUMN parts INTEGER NOT NULL DEFAULT 1")?;
+        for (column, definition) in [("parts", "parts INTEGER NOT NULL DEFAULT 1"), ("conflict", "conflict TEXT")] {
+            let exists: bool =
+                conn.query_row("SELECT COUNT(*) FROM pragma_table_info('events') WHERE name = ?1", [column], |r| {
+                    r.get(0)
+                })?;
+            if !exists {
+                conn.execute_batch(&format!("ALTER TABLE events ADD COLUMN {definition}"))?;
+            }
         }
         Ok(Self { conn, dir: dir.to_path_buf() })
     }
@@ -112,8 +118,8 @@ impl Store {
         let d = e.decision;
         self.conn.execute(
             "INSERT INTO events (ts, duration_ms, peak_db, ambient_db, label, status, similarity,
-                                 nearest_label, top_classes, clip_path, embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                                 nearest_label, top_classes, clip_path, embedding, conflict)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 e.ts,
                 e.duration_ms,
@@ -126,6 +132,7 @@ impl Store {
                 serde_json::to_string(e.top_classes)?,
                 e.clip_path,
                 to_blob(e.embedding),
+                d.conflict,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -163,9 +170,18 @@ impl Store {
     }
 
     pub fn exemplars(&self) -> Result<Vec<Exemplar>> {
-        let mut stmt = self.conn.prepare("SELECT label, embedding FROM exemplars")?;
-        let rows =
-            stmt.query_map([], |r| Ok(Exemplar { label: r.get(0)?, embedding: from_blob(&r.get::<_, Vec<u8>>(1)?) }))?;
+        let mut stmt = self.conn.prepare(
+            "SELECT x.label, x.embedding, e.top_classes FROM exemplars x JOIN events e ON e.id = x.event_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let top: Vec<(String, f32)> = serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default();
+            let model_class = classify::sounds(top)
+                .into_iter()
+                .next()
+                .filter(|(_, score)| *score >= classify::MIN_SOUND_SCORE)
+                .map(|(class, _)| class);
+            Ok(Exemplar { label: r.get(0)?, embedding: from_blob(&r.get::<_, Vec<u8>>(1)?), model_class })
+        })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -243,7 +259,7 @@ impl Store {
 
 const SELECT_EVENT: &str = "
     SELECT e.id, e.ts, e.duration_ms, e.peak_db, e.ambient_db, e.label, e.status, e.similarity,
-           e.nearest_label, e.top_classes, e.clip_path, x.id IS NOT NULL, e.parts
+           e.nearest_label, e.top_classes, e.clip_path, x.id IS NOT NULL, e.parts, e.conflict
     FROM events e LEFT JOIN exemplars x ON x.event_id = e.id";
 
 fn event_from_row(r: &Row) -> rusqlite::Result<Event> {
@@ -261,6 +277,7 @@ fn event_from_row(r: &Row) -> rusqlite::Result<Event> {
         clip_path: r.get(10)?,
         exemplar: r.get(11)?,
         parts: r.get(12)?,
+        conflict: r.get(13)?,
     })
 }
 
@@ -291,7 +308,7 @@ mod tests {
     }
 
     fn insert(store: &Store, ts: i64, label: &str, embedding: &[f32]) -> i64 {
-        let decision = Decision { status: Status::Pending, label: label.into(), nearest: None };
+        let decision = Decision { status: Status::Pending, label: label.into(), nearest: None, conflict: None };
         store
             .insert_event(&NewEvent {
                 ts,
@@ -317,6 +334,7 @@ mod tests {
         let exemplars = store.exemplars().unwrap();
         assert_eq!(exemplars.len(), 1);
         assert_eq!((exemplars[0].label.as_str(), exemplars[0].embedding.clone()), ("back door", vec![0.6, 0.8]));
+        assert_eq!(exemplars[0].model_class.as_deref(), Some("Door"));
     }
 
     #[test]
@@ -375,7 +393,8 @@ mod tests {
             .unwrap();
         let store = Store::open(&dir).unwrap();
         let id = insert(&store, 1_000, "door", &[1.0]);
-        assert_eq!(store.event(id).unwrap().unwrap().parts, 1);
+        let e = store.event(id).unwrap().unwrap();
+        assert_eq!((e.parts, e.conflict), (1, None));
     }
 
     #[test]

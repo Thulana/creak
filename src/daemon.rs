@@ -247,6 +247,7 @@ fn handle_clip(config: &Config, store: &Store, tagger: &Tagger, clip: &Clip, las
         *last = None;
     } else if let Some(prev) = *last
         && c.group_gap_s > 0
+        && decision.conflict.is_none()
         && onset_ts - prev.end_ts <= c.group_gap_s as i64 * 1000
         && store.event(prev.id)?.is_some_and(|e| e.label == decision.label)
     {
@@ -278,8 +279,9 @@ fn handle_clip(config: &Config, store: &Store, tagger: &Tagger, clip: &Clip, las
         *last = Some(Latest { id, end_ts });
     }
     let nearest = decision.nearest.map(|(l, s)| format!(", nearest {l} {s:.2}")).unwrap_or_default();
+    let conflict = decision.conflict.map(|c| format!(", model hears {c}: asking")).unwrap_or_default();
     eprintln!(
-        "event {id}: {:?} {:?} ({}{nearest}) in {} ms",
+        "event {id}: {:?} {:?} ({}{nearest}{conflict}) in {} ms",
         decision.status,
         decision.label,
         top.iter().map(|(n, s)| format!("{n} {s:.2}")).collect::<Vec<_>>().join(", "),
@@ -344,6 +346,54 @@ mod tests {
         }
         let events = store.events(&crate::store::Filter { limit: 10, ..Default::default() }).unwrap();
         assert_eq!(events.iter().map(|e| (e.parts, e.duration_ms)).collect::<Vec<_>>(), vec![(1, 2_500), (2, 7_000)]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_match_the_model_contradicts_goes_to_review_and_is_not_grouped() {
+        let dir = std::env::temp_dir().join(format!("creak-conflict-{}", std::process::id()));
+        let mut config = Config::default();
+        config.storage.dir = dir.clone();
+        let mut store = Store::open(&dir).unwrap();
+        let tagger = Tagger::load().unwrap();
+        let sound: Vec<f32> =
+            (0..40_000).map(|i| (2.0 * std::f32::consts::PI * 1_000.0 * i as f32 / 16_000.0).sin() * 0.5).collect();
+        let tags = tagger.tag(&sound).unwrap();
+        let heard = classify::sounds(tagger.top_classes(&tags.scores, 20)).remove(0);
+        assert!(
+            heard.1 >= classify::MIN_CONFLICT_SCORE && heard.0 != "Music",
+            "fixture must be heard as a sound: {heard:?}"
+        );
+
+        // A "music" exemplar with this very embedding, but which the model heard as Music.
+        let taught = classify::Decision {
+            status: classify::Status::Pending,
+            label: "music".into(),
+            nearest: None,
+            conflict: None,
+        };
+        let music = store
+            .insert_event(&NewEvent {
+                ts: 1_000_000,
+                duration_ms: 2_500,
+                peak_db: -20.0,
+                ambient_db: -60.0,
+                decision: &taught,
+                top_classes: &[("Music".into(), 0.9)],
+                clip_path: None,
+                embedding: &tags.embedding,
+            })
+            .unwrap();
+        store.label_event(music, "music").unwrap();
+
+        let clip = Clip { samples: sound, onset: 0, ts: 1_003_000, peak_db: -20.0, ambient_db: -60.0 };
+        let mut last = Some(Latest { id: music, end_ts: 1_002_500 });
+        handle_clip(&config, &store, &tagger, &clip, &mut last).unwrap();
+        let newest = &store.events(&crate::store::Filter { limit: 1, ..Default::default() }).unwrap()[0];
+        assert_ne!(newest.id, music);
+        assert_eq!((newest.status.as_str(), newest.label.as_str()), ("pending", "music"));
+        assert_eq!(newest.conflict.as_deref(), Some(heard.0.as_str()));
+        assert_eq!(store.event(music).unwrap().unwrap().parts, 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 

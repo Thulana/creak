@@ -36,7 +36,9 @@ Open that link from any device on your network. The token is stored in `/etc/cre
 ## Using it
 
 - **Live** shows the microphone level, the ambient level and the line a sound has to cross. Check it first: if the level does not move when you talk, the wrong device is selected (`creak devices`, then `[audio] device` in the config). The sliders below the graph move the open line, the close line and the ambient floor while you watch; they are saved and override the config file until you press Reset.
-- **Review** lists clips waiting for an answer, each with the model's guess as a question ("Door?"). Play it, then confirm (`Y`), type the right label and correct (`C`), or ignore (`I`). Space plays, `J`/`K` move.
+- **Review** lists clips waiting for an answer, each with a proposed label as a question ("Door?"). Play it, then confirm (`Y`), type the right label and correct (`C`), or ignore (`I`). When the model disagrees with the proposal the card says so ("Music? · the model hears Cough") and `M` answers with the model's sound. Space plays, `J`/`K` move.
+
+  A clip is asked about when no taught clip is close enough to tag it, or when one is close but the model is sure it hears a different sound than that label's taught clips. Everything else is tagged without asking.
 - **Events** is the full log, with the nearest learned sound and its similarity for every clip. A wrong match can be relabelled here.
 
 One answer per sound is enough. A clip you confirm becomes an example; the next clip whose similarity to it is above `match_threshold` gets its label automatically. `ignore` works the same way, for sounds you never want to hear about again.
