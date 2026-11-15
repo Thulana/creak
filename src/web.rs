@@ -1,0 +1,232 @@
+//! The web UI: one embedded page and a small JSON API on the same port.
+
+use crate::config::{self, Tuning};
+use crate::daemon::SharedLive;
+use crate::store::{Filter, Store};
+use anyhow::{Result, anyhow};
+use serde::Deserialize;
+use serde_json::json;
+use std::collections::HashMap;
+use std::io::Read;
+use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
+
+const PAGE: &str = include_str!("../ui/index.html");
+
+type Reply = Response<std::io::Cursor<Vec<u8>>>;
+
+/// `file_tuning` holds the config file's trigger values, which a reset in the Live view returns to.
+pub fn serve(config: &config::Web, file_tuning: Tuning, mut store: Store, live: SharedLive) -> Result<()> {
+    let server = Server::http(&config.listen).map_err(|e| anyhow!("listening on {}: {e}", config.listen))?;
+    eprintln!("web UI on http://{}/", config.listen);
+    for mut request in server.incoming_requests() {
+        let reply = handle(&mut request, &config.token, file_tuning, &mut store, &live)
+            .unwrap_or_else(|e| text(500, &format!("{e:#}")));
+        let _ = request.respond(reply);
+    }
+    Ok(())
+}
+
+fn handle(
+    request: &mut Request,
+    token: &str,
+    file_tuning: Tuning,
+    store: &mut Store,
+    live: &SharedLive,
+) -> Result<Reply> {
+    let url = request.url().to_string();
+    let (path, query) = split_url(&url);
+    let path: Vec<&str> = path.trim_matches('/').split('/').collect();
+    let method = request.method().clone();
+
+    if method == Method::Get && path == [""] {
+        return Ok(with_type(Response::from_data(PAGE.as_bytes().to_vec()), "text/html; charset=utf-8"));
+    }
+    if !authorized(request, &query, token) {
+        return Ok(text(401, "missing or wrong token"));
+    }
+    Ok(match (method, path.as_slice()) {
+        (Method::Get, ["api", "live"]) => {
+            let since: u64 = query.get("since").and_then(|s| s.parse().ok()).unwrap_or(0);
+            let l = live.lock().unwrap();
+            let fresh = (l.frame.saturating_sub(since) as usize).min(l.levels.len());
+            json_reply(&json!({
+                "device": l.device, "device_rate": l.device_rate, "frame": l.frame,
+                "levels": l.levels.iter().skip(l.levels.len() - fresh).collect::<Vec<_>>(),
+                "ambient_db": l.ambient_db, "open_db": l.open_db, "close_db": l.close_db, "recording": l.recording, "error": l.error,
+                "measured_ambient_db": l.measured_ambient_db, "tuning": l.tuning, "tuned": l.tuned,
+            }))
+        }
+        (Method::Get, ["api", "events"]) => {
+            let filter = Filter {
+                status: query.get("status").filter(|s| !s.is_empty()).cloned(),
+                label: query.get("label").filter(|s| !s.is_empty()).cloned(),
+                since_ms: None,
+                before_id: query.get("before").and_then(|s| s.parse().ok()),
+                hide_ignored: query.get("hide_ignored").is_some_and(|v| v == "1"),
+                limit: query.get("limit").and_then(|s| s.parse().ok()).unwrap_or(50).clamp(1, 500),
+            };
+            json_reply(&json!({ "events": store.events(&filter)? }))
+        }
+        (Method::Get, ["api", "labels"]) => {
+            json_reply(&json!({ "labels": store.labels()?, "pending": store.pending_count()? }))
+        }
+        (Method::Post, ["api", "trigger"]) => {
+            let Ok(tuning) = serde_json::from_str::<Tuning>(&read_body(request)?) else {
+                return Ok(text(400, "expected {\"ratio\", \"close_ratio\", \"ambient_floor_db\"}"));
+            };
+            if let Err(e) = config::Trigger::default().with_tuning(tuning).validate() {
+                return Ok(text(400, &e.to_string()));
+            }
+            store.set_trigger_tuning(Some(&tuning))?;
+            retune(live, tuning, true)
+        }
+        (Method::Delete, ["api", "trigger"]) => {
+            store.set_trigger_tuning(None)?;
+            retune(live, file_tuning, false)
+        }
+        (Method::Post, ["api", "events", id, "label"]) => {
+            #[derive(Deserialize)]
+            struct Body {
+                label: String,
+            }
+            let Ok(body) = serde_json::from_str::<Body>(&read_body(request)?) else {
+                return Ok(text(400, "expected {\"label\": \"…\"}"));
+            };
+            let Ok(id) = id.parse() else { return Ok(text(404, "no such event")) };
+            match store.label_event(id, &body.label) {
+                Ok(event) => json_reply(&json!({ "event": event })),
+                Err(e) => text(400, &format!("{e:#}")),
+            }
+        }
+        (Method::Get, ["api", "clips", id]) => {
+            let clip = id
+                .trim_end_matches(".wav")
+                .parse()
+                .ok()
+                .and_then(|id| store.event(id).ok().flatten())
+                .and_then(|e| e.clip_path);
+            match clip {
+                Some(rel) => wav(request, &std::fs::read(store.dir().join(rel))?),
+                None => text(404, "no clip for this event"),
+            }
+        }
+        _ => text(404, "not found"),
+    })
+}
+
+fn retune(live: &SharedLive, tuning: Tuning, tuned: bool) -> Reply {
+    let mut l = live.lock().unwrap();
+    (l.tuning, l.tuned, l.retune) = (tuning, tuned, true);
+    json_reply(&json!({ "tuning": l.tuning, "tuned": l.tuned }))
+}
+
+fn read_body(request: &mut Request) -> Result<String> {
+    let mut body = String::new();
+    request.as_reader().take(4096).read_to_string(&mut body)?;
+    Ok(body)
+}
+
+fn authorized(request: &Request, query: &HashMap<String, String>, token: &str) -> bool {
+    if token.is_empty() {
+        return true;
+    }
+    let bearer = format!("Bearer {token}");
+    query.get("token").is_some_and(|t| t == token)
+        || request.headers().iter().any(|h| h.field.equiv("Authorization") && h.value.as_str() == bearer)
+}
+
+/// Serves a WAV, honouring a single `Range: bytes=a-b`; Safari will not play audio without it.
+fn wav(request: &Request, data: &[u8]) -> Reply {
+    let range = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Range"))
+        .and_then(|h| parse_range(h.value.as_str(), data.len()));
+    let response = match range {
+        Some((start, end)) => Response::from_data(data[start..=end].to_vec())
+            .with_status_code(StatusCode(206))
+            .with_header(header("Content-Range", &format!("bytes {start}-{end}/{}", data.len()))),
+        None => Response::from_data(data.to_vec()),
+    };
+    with_type(response.with_header(header("Accept-Ranges", "bytes")), "audio/wav")
+}
+
+fn parse_range(value: &str, len: usize) -> Option<(usize, usize)> {
+    let (start, end) = value.strip_prefix("bytes=")?.split_once('-')?;
+    let (start, end) = match (start.parse::<usize>(), end.parse::<usize>()) {
+        (Ok(s), Ok(e)) => (s, e.min(len - 1)),
+        (Ok(s), Err(_)) => (s, len - 1),
+        (Err(_), Ok(suffix)) => (len.saturating_sub(suffix), len - 1),
+        _ => return None,
+    };
+    (start <= end && end < len).then_some((start, end))
+}
+
+fn split_url(url: &str) -> (&str, HashMap<String, String>) {
+    let (path, query) = url.split_once('?').unwrap_or((url, ""));
+    let params = query.split('&').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (decode(k), decode(v))).collect();
+    (path, params)
+}
+
+fn decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => out.push(b' '),
+            b'%' => match s.get(i + 1..i + 3).and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
+                Some(b) => {
+                    out.push(b);
+                    i += 2;
+                }
+                None => out.push(b'%'),
+            },
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn header(name: &str, value: &str) -> Header {
+    Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("valid header")
+}
+
+fn with_type(response: Reply, content_type: &str) -> Reply {
+    response.with_header(header("Content-Type", content_type)).with_header(header("Cache-Control", "no-store"))
+}
+
+fn json_reply(value: &serde_json::Value) -> Reply {
+    with_type(Response::from_data(value.to_string().into_bytes()), "application/json")
+}
+
+fn text(code: u16, message: &str) -> Reply {
+    with_type(
+        Response::from_data(message.as_bytes().to_vec()).with_status_code(StatusCode(code)),
+        "text/plain; charset=utf-8",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ranges() {
+        assert_eq!(parse_range("bytes=0-1", 10), Some((0, 1)));
+        assert_eq!(parse_range("bytes=4-", 10), Some((4, 9)));
+        assert_eq!(parse_range("bytes=-3", 10), Some((7, 9)));
+        assert_eq!(parse_range("bytes=0-99", 10), Some((0, 9)));
+        assert_eq!(parse_range("bytes=12-", 10), None);
+    }
+
+    #[test]
+    fn query_decoding() {
+        let (path, q) = split_url("/api/events?label=front%20door&status=pending&x=a+b&bad=%zz");
+        assert_eq!(path, "/api/events");
+        assert_eq!(q["label"], "front door");
+        assert_eq!(q["x"], "a b");
+        assert_eq!(q["bad"], "%zz");
+    }
+}

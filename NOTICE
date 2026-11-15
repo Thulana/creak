@@ -1,0 +1,13 @@
+creak embeds third-party material in its binary:
+
+YAMNet model weights (model/yamnet.onnx, converted from yamnet.h5)
+  From https://github.com/tensorflow/models/tree/master/research/audioset/yamnet
+  Copyright Google LLC. Licensed under the Apache License, Version 2.0:
+  https://www.apache.org/licenses/LICENSE-2.0
+  Converted to ONNX by model/convert.py; batch normalisation is folded into the
+  convolutions. No other change to the weights.
+
+AudioSet class names (model/yamnet_class_map.csv)
+  From the AudioSet ontology, https://github.com/audioset/ontology
+  Copyright Google LLC. Licensed under CC BY-SA 4.0:
+  https://creativecommons.org/licenses/by-sa/4.0/
