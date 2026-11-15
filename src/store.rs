@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS events (
     conflict      TEXT,               -- the model's class when it contradicted the label and the clip went to review
     nearest_event INTEGER,            -- the event whose clip is the nearest exemplar
     mix           TEXT    NOT NULL DEFAULT '[]', -- JSON [{class, share, peak, background}, ...], most present first
-    checked       TEXT                -- a sampled match: due | right | wrong; NULL when not sampled
+    checked       TEXT,               -- a sampled match: due | right | wrong; NULL when not sampled
+    model         TEXT    NOT NULL DEFAULT 'yamnet' -- the model behind embedding, top_classes and mix
 );
 CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
 CREATE TABLE IF NOT EXISTS exemplars (
@@ -104,6 +105,8 @@ pub struct NewEvent<'a> {
     pub mix: &'a [MixPart],
     /// A match sampled for a "was this right?" check.
     pub check: bool,
+    /// The model behind the embedding, the top classes and the mix.
+    pub model: &'a str,
 }
 
 pub struct NewClassification<'a> {
@@ -203,6 +206,15 @@ pub struct LabelStats {
 }
 
 /// An audited clip, for `creak eval`.
+/// An event's kept clip, to be analysed again.
+pub struct StoredClip {
+    pub event_id: i64,
+    pub ts: i64,
+    pub clip_path: String,
+    pub onset_ms: Option<i64>,
+    pub sound_end_ms: Option<i64>,
+}
+
 pub struct Audited {
     pub event_id: i64,
     pub ts: i64,
@@ -243,6 +255,7 @@ impl Store {
             ("events", "nearest_event", "INTEGER"),
             ("events", "mix", "TEXT NOT NULL DEFAULT '[]'"),
             ("events", "checked", "TEXT"),
+            ("events", "model", "TEXT NOT NULL DEFAULT 'yamnet'"),
             ("classifications", "mix", "TEXT NOT NULL DEFAULT '[]'"),
             ("classifications", "background", "TEXT"),
         ] {
@@ -274,8 +287,9 @@ impl Store {
         let d = e.decision;
         self.conn.execute(
             "INSERT INTO events (ts, duration_ms, peak_db, ambient_db, label, status, similarity,
-                                 nearest_label, top_classes, clip_path, embedding, conflict, nearest_event, mix, checked)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                                 nearest_label, top_classes, clip_path, embedding, conflict, nearest_event, mix, checked,
+                                 model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 e.ts,
                 e.duration_ms,
@@ -292,6 +306,7 @@ impl Store {
                 e.nearest_event,
                 serde_json::to_string(e.mix)?,
                 e.check.then_some("due"),
+                e.model,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -382,12 +397,13 @@ impl Store {
         Ok(())
     }
 
-    pub fn exemplars(&self) -> Result<Vec<Exemplar>> {
+    /// The taught examples analysed by `model`; another model's embeddings cannot be compared.
+    pub fn exemplars(&self, model: &str) -> Result<Vec<Exemplar>> {
         let mut stmt = self.conn.prepare(
             "SELECT x.label, x.embedding, e.top_classes, x.event_id, e.mix
-             FROM exemplars x JOIN events e ON e.id = x.event_id",
+             FROM exemplars x JOIN events e ON e.id = x.event_id WHERE e.model = ?1",
         )?;
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map([model], |r| {
             let top: Vec<(String, f32)> = serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default();
             let mix: Vec<MixPart> = serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default();
             Ok(Exemplar {
@@ -398,6 +414,56 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Events analysed by another model than `model` that still have their clip, oldest first,
+    /// with the onset and sound end of their first clip when its classification was kept.
+    pub fn stale_clips(&self, model: &str) -> Result<Vec<StoredClip>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT e.id, e.ts, e.clip_path, c.onset_ms, c.sound_end_ms
+             FROM events e
+             LEFT JOIN classifications c ON c.id = (SELECT MIN(id) FROM classifications WHERE event_id = e.id)
+             WHERE e.model <> ?1 AND e.clip_path IS NOT NULL AND length(e.embedding) > 0
+             ORDER BY e.ts",
+        )?;
+        let rows = stmt.query_map([model], |r| {
+            Ok(StoredClip {
+                event_id: r.get(0)?,
+                ts: r.get(1)?,
+                clip_path: r.get(2)?,
+                onset_ms: r.get(3)?,
+                sound_end_ms: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Drops the embedding of events analysed by another model than `model` whose clip is gone,
+    /// as expiry does: without the audio it cannot be redone. Returns how many.
+    pub fn drop_stale_embeddings(&self, model: &str) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE events SET embedding = x'' WHERE model <> ?1 AND clip_path IS NULL AND length(embedding) > 0",
+            [model],
+        )?)
+    }
+
+    /// Replaces an event's analysis with `model`'s, and its exemplar's embedding with it.
+    pub fn reanalysed(
+        &mut self,
+        id: i64,
+        model: &str,
+        embedding: &[f32],
+        top_classes: &[(String, f32)],
+        mix: &[MixPart],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE events SET model = ?2, embedding = ?3, top_classes = ?4, mix = ?5 WHERE id = ?1",
+            params![id, model, to_blob(embedding), serde_json::to_string(top_classes)?, serde_json::to_string(mix)?],
+        )?;
+        tx.execute("UPDATE exemplars SET embedding = ?2 WHERE event_id = ?1", params![id, to_blob(embedding)])?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn events(&self, f: &Filter) -> Result<Vec<Event>> {
@@ -826,8 +892,30 @@ mod tests {
                 nearest_event: None,
                 mix: &[],
                 check: false,
+                model: "yamnet",
             })
             .unwrap()
+    }
+
+    #[test]
+    fn another_models_events_are_analysed_again_or_lose_their_embedding() {
+        let mut store = temp_store();
+        let kept = insert(&store, 1, "door", &[1.0, 0.0]);
+        store.label_event(kept, "door").unwrap();
+        let gone = insert(&store, 2, "door", &[1.0, 0.0]);
+        store.conn.execute("UPDATE events SET clip_path = NULL WHERE id = ?1", [gone]).unwrap();
+
+        assert_eq!(store.drop_stale_embeddings("ced-tiny").unwrap(), 1);
+        assert!(store.label_event(gone, "door").is_err(), "nothing left to teach from");
+        let stale: Vec<i64> = store.stale_clips("ced-tiny").unwrap().iter().map(|s| s.event_id).collect();
+        assert_eq!(stale, [kept]);
+        assert!(store.exemplars("ced-tiny").unwrap().is_empty(), "yamnet's embeddings are not compared");
+
+        store.reanalysed(kept, "ced-tiny", &[0.0, 1.0], &[("Knock".into(), 0.4)], &[]).unwrap();
+        let x = store.exemplars("ced-tiny").unwrap();
+        assert_eq!((x.len(), x[0].embedding.as_slice()), (1, &[0.0, 1.0][..]));
+        assert!(store.exemplars("yamnet").unwrap().is_empty());
+        assert!(store.stale_clips("ced-tiny").unwrap().is_empty());
     }
 
     #[test]
@@ -838,7 +926,7 @@ mod tests {
         assert_eq!((e.status.as_str(), e.exemplar), ("confirmed", true));
         let e = store.label_event(id, "back door").unwrap().event;
         assert_eq!(e.status, "corrected");
-        let exemplars = store.exemplars().unwrap();
+        let exemplars = store.exemplars("yamnet").unwrap();
         assert_eq!(exemplars.len(), 1);
         assert_eq!((exemplars[0].label.as_str(), exemplars[0].embedding.clone()), ("back door", vec![0.6, 0.8]));
         let heard = exemplars[0].heard.as_ref().map(|h| (h.class.as_str(), h.score));
@@ -850,7 +938,7 @@ mod tests {
         let mut store = temp_store();
         let id = insert(&store, now_ms(), "door", &[1.0]);
         assert!(store.label_event(id, " Silence ").is_err());
-        assert!(store.exemplars().unwrap().is_empty());
+        assert!(store.exemplars("yamnet").unwrap().is_empty());
     }
 
     #[test]
@@ -987,6 +1075,7 @@ mod tests {
                 nearest_event: Some(cause),
                 mix: &[],
                 check,
+                model: "yamnet",
             })
             .unwrap();
         store
@@ -1026,7 +1115,7 @@ mod tests {
         store.label_event(id, "music").unwrap();
         let e = store.skip_event(id).unwrap();
         assert_eq!((e.status.as_str(), e.label.as_str(), e.exemplar), ("skipped", "music", false));
-        assert!(store.exemplars().unwrap().is_empty());
+        assert!(store.exemplars("yamnet").unwrap().is_empty());
         assert!(review(&store).is_empty());
         assert!(store.skip_event(9_999).is_err());
     }
@@ -1171,7 +1260,7 @@ mod tests {
         assert!(store.audit(other, Some("silence")).is_err());
         assert!(store.audit(9_999, Some("cough")).is_err());
         assert_eq!(store.next_audit().unwrap(), Some(other));
-        assert!(store.exemplars().unwrap().is_empty(), "an audit never teaches");
+        assert!(store.exemplars("yamnet").unwrap().is_empty(), "an audit never teaches");
         assert_eq!(store.audit_counts().unwrap(), vec![(None, 1), (Some("cough".into()), 1)]);
 
         // Past retention, the audited clip stays; one that could not be told goes like any other.

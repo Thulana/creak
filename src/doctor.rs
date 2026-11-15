@@ -3,7 +3,7 @@
 
 use crate::capture;
 use crate::config::{Config, DEFAULT_PATH};
-use crate::embed::Tagger;
+use crate::embed::{Model, Tagger};
 use crate::setup::{self, Service};
 use crate::store::{Store, now_ms};
 use crate::trigger::SAMPLE_RATE;
@@ -68,8 +68,9 @@ pub fn run(config_path: &Path) -> Result<()> {
         }
     };
 
-    match test_model() {
-        Ok(ms) => report.line(Mark::Ok, "model", format!("loads and tags 1 s of audio in {ms} ms")),
+    let model = file.classify.model;
+    match test_model(model) {
+        Ok(ms) => report.line(Mark::Ok, "model", format!("{} loads and tags 1 s of audio in {ms} ms", model.name())),
         Err(e) => report.line(Mark::Fail, "model", format!("{e:#}")),
     }
 
@@ -148,8 +149,8 @@ fn storage(report: &mut Report, file: &Config, store: &Store) -> Config {
 }
 
 /// Loads the embedded model and tags a second of a test tone; returns how long tagging took.
-fn test_model() -> Result<u128> {
-    let tagger = Tagger::load()?;
+fn test_model(model: Model) -> Result<u128> {
+    let tagger = Tagger::load(model)?;
     let tone: Vec<f32> = (0..SAMPLE_RATE as usize)
         .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / SAMPLE_RATE as f32).sin() * 0.3)
         .collect();

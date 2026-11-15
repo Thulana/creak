@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::Command;
 
 #[cfg(target_os = "linux")]
-pub use linux::{service, setup, uninstall};
+pub use linux::{restart_if_running, service, setup, uninstall};
 
 #[cfg(not(target_os = "linux"))]
 pub fn setup(_config_path: &Path) -> Result<()> {
@@ -34,6 +34,13 @@ pub enum Service {
 #[cfg(not(target_os = "linux"))]
 pub fn service() -> Option<Service> {
     None
+}
+
+/// Restarts the service when it is running, so a changed config file applies. False when it is
+/// not running, or where creak cannot install a service yet.
+#[cfg(not(target_os = "linux"))]
+pub fn restart_if_running() -> Result<bool> {
+    Ok(false)
 }
 
 /// The web UI's address for a browser on another machine, with the token; None when it is off.
@@ -182,6 +189,14 @@ mod linux {
             }
             (_, state) => Service::Stopped(state.to_string()),
         })
+    }
+
+    pub fn restart_if_running() -> Result<bool> {
+        if !matches!(service(), Some(Service::Running { .. })) {
+            return Ok(false);
+        }
+        run("systemctl", &["restart", "creak"])?;
+        Ok(true)
     }
 
     pub fn uninstall(config_path: &Path, purge: bool) -> Result<()> {

@@ -235,7 +235,12 @@ fn settings_reply(file: &Config, store: &Store, settings: &SharedSettings) -> Re
     Ok(json_reply(&json!({
         "fields": fields,
         "mode": s.mode,
-        "file_only": { "audio.device": file.audio.device, "storage.dir": file.storage.dir, "web.listen": file.web.listen },
+        "file_only": {
+            "audio.device": file.audio.device,
+            "classify.model": file.classify.model,
+            "storage.dir": file.storage.dir,
+            "web.listen": file.web.listen,
+        },
         "clip_mb": clip_mb,
     })))
 }

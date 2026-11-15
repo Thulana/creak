@@ -350,7 +350,7 @@ dependencies = [
 
 [[package]]
 name = "creak"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -363,6 +363,7 @@ dependencies = [
  "serde_json",
  "tiny_http",
  "toml",
+ "toml_edit",
  "tract-onnx",
 ]
 
@@ -1613,6 +1614,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 

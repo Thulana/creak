@@ -31,10 +31,10 @@ Linux comes first. macOS and Windows follow later (Phase 6), so platform-specifi
 | Language | Rust, one binary | Nothing to install besides the binary. Low idle memory for a 24/7 process. |
 | Capture | `cpal`, resampled to 16 kHz mono | ALSA on Linux, CoreAudio and WASAPI later, from the same code. |
 | Tagging | One pretrained audio model used two ways: its own AudioSet classes give the first guess, and its embedding is matched against your confirmed clips | The first guess needs no setup. A confirmed clip is ground truth, so one is enough to match the same sound again. Runs in milliseconds on CPU. |
-| Model | YAMNet (MobileNetV1 on log-mel patches, 521 AudioSet classes, 1024-d embedding), converted to ONNX by `model/convert.py`. Apache-2.0. | Small, well documented, outputs both class scores and an embedding. On Phase 0 data the nearest exemplar had the right label for 35 of 38 clips. CED-tiny stays the alternative if the Phase 1 replay shows it does not separate your sounds well enough. |
+| Model | YAMNet by default (MobileNetV1 on log-mel patches, 521 AudioSet classes, 1024-d embedding), converted to ONNX by `model/convert.py`. CED-tiny (a ViT distilled from an ensemble, 5.5 M parameters, 527 classes, 192-d embedding), exported by `model/convert_ced.py`, is built in too and chosen with `[classify] model`. Both Apache-2.0. | YAMNet: small, well documented, outputs both class scores and an embedding; on Phase 0 data the nearest exemplar had the right label for 35 of 38 clips. CED-tiny scores 0.481 mAP on AudioSet against YAMNet's 0.306, takes 16 kHz audio like the microphone, and had the best nearest-neighbour score of 13 encoders in the X-ARES benchmark (its base size). It costs about twice YAMNet's CPU time. `creak eval --model ced-tiny` replays the audited clips with it; the Phase 1 replay decides the default. |
 | Inference | `tract-onnx`, pure Rust | No native library to link or ship, so cross-compiling for aarch64, macOS and Windows stays trivial. |
-| Frontend | Log-mel computed in Rust, matching YAMNet's TensorFlow frontend | The ONNX graph stays a plain CNN. Checked against the TensorFlow reference on a fixture. |
-| Model file | Embedded in the binary | One download, no second fetch at install time. |
+| Frontend | Log-mel computed in Rust, matching each model's own frontend: TensorFlow's for YAMNet, torchaudio's for CED | The ONNX graph holds only the network, which tract runs (it cannot run CED's own STFT export). Each is checked against its reference on a fixture. |
+| Model file | Both embedded in the binary (YAMNet 15 MB, CED-tiny 22 MB) | One download, no second fetch at install time, and switching needs no network. |
 | Storage | SQLite (`rusqlite`, bundled) + WAV clips | No database server. |
 | Review surface | Web UI served by the daemon (§3.7), plus CLI commands | A home server is headless, and you have to hear a clip to label it. Everything except playback also works from the CLI. |
 | Output | MQTT with HA discovery. The SQLite log always exists. | Standard route into Home Assistant and anything else. |
@@ -123,12 +123,13 @@ A clip often holds more than one sound: music, several voices, a laugh. Its tags
 
 ### 3.5 Storage and privacy
 
-- `events(id, ts, duration_ms, peak_db, ambient_db, label, status, similarity, nearest_label, top_classes, clip_path, embedding, parts, conflict, nearest_event, mix, checked)`. Status is match, pending, ignored, confirmed, corrected or skipped. `nearest_event` is the exemplar behind a match, `checked` the match check (§3.8): due, right or wrong. Scenes (§3.4) add `scene`.
+- `events(id, ts, duration_ms, peak_db, ambient_db, label, status, similarity, nearest_label, top_classes, clip_path, embedding, parts, conflict, nearest_event, mix, checked, model)`. Status is match, pending, ignored, confirmed, corrected or skipped. `nearest_event` is the exemplar behind a match, `checked` the match check (§3.8): due, right or wrong. Scenes (§3.4) add `scene`.
 - `exemplars(id, event_id, label, embedding, created_ts)`; the clip is the event's.
 - `audits(event_id, label, created_ts)`: what a clip is, said in the Audit view; NULL when it could not be told. Never an exemplar (§3.8).
 - `classifications`: everything the model and the classifier worked out for each clip, one row per clip, including clips grouped into an earlier event and clips dropped as silence. The class scores (all 521), the embedding, the top classes of every patch, the sound mix and the sounds heard in the pre-roll, the onset, sound end and analysis window, the decision with each label's best similarity and the nearest exemplar's event, the trigger and classify settings in effect, and the model's name. It is the long-term record: it never expires, so thresholds can be replayed and scenes (§3.4) computed for the past after the clips are gone. 10–16 KB per clip: 6 KB of embedding and scores, and the per-patch classes, which grow with the clip's length.
 - `labels(name, kind)` arrives with scenes; until then labels are derived from exemplars.
 - Clips will contain conversations. They never leave the machine.
+- **Switching the model.** Each event records the model behind its embedding, top classes and mix, and exemplars are compared only with clips from the same model. At start the daemon analyses every event that still has its clip again with the configured model, so exemplars carry over; an event whose clip is gone loses its embedding, as at expiry. A clip that fails stays with the old model and is tried again at the next start.
 - Clips that are neither exemplars nor audited are deleted after `retention_days` (default 14), and the oldest go first once all clips together take more than `max_mb` (default 2000). Both are checked every 10 minutes. Exemplar and audited clips count towards the cap but are kept, so they can be re-embedded if the model changes and replayed by `creak eval`.
 
 ### 3.6 MQTT
@@ -201,7 +202,8 @@ creak events [--since 1d] [--label door] [--json]
 creak review                    # pending count, and the web UI URL if it is enabled
 creak label <event-id> <label|ignore>
 creak skip <event-id>           # answer without teaching; removes an exemplar
-creak eval                      # replay the audited clips (§3.8)
+creak eval [--model <name>]     # replay the audited clips (§3.8), optionally with another model
+creak model [<name>]            # list the models; with a name, set it in the config and restart
 creak labels                    # exemplar count and corrected-match rate per label
 creak labels rename <label> <new> | delete <label>
 creak teach <scene> --for 10m
@@ -232,6 +234,7 @@ pre_roll_ms = 1500
 ambient_floor_db = -60
 
 [classify]
+model = "yamnet"          # or "ced-tiny"; needs a restart
 match_threshold = 0.85
 suggest_threshold = 0.60
 sound_score = 0.1
@@ -264,7 +267,7 @@ creak/
 ├── plan.md
 ├── Cargo.toml
 ├── install.sh
-├── model/             # convert.py, yamnet.onnx, class map, licence notes
+├── model/             # convert.py, convert_ced.py, yamnet.onnx, ced_tiny.onnx, class maps, licence notes
 ├── src/
 │   ├── main.rs        # clap commands
 │   ├── config.rs      # config file and defaults

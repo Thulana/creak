@@ -1,3 +1,4 @@
+use crate::embed::Model;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -43,6 +44,9 @@ pub struct Trigger {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Classify {
+    /// The model that tags clips. Changing it needs a restart; the daemon then analyses the clips
+    /// it still has again, so taught examples carry over. The thresholds were set for YAMNet.
+    pub model: Model,
     pub match_threshold: f32,
     pub suggest_threshold: f32,
     /// The weakest model score that still counts as hearing a sound.
@@ -97,7 +101,14 @@ impl Default for Trigger {
 
 impl Default for Classify {
     fn default() -> Self {
-        Self { match_threshold: 0.85, suggest_threshold: 0.60, sound_score: 0.1, conflict_score: 0.3, group_gap_s: 10 }
+        Self {
+            model: Model::Yamnet,
+            match_threshold: 0.85,
+            suggest_threshold: 0.60,
+            sound_score: 0.1,
+            conflict_score: 0.3,
+            group_gap_s: 10,
+        }
     }
 }
 
@@ -308,6 +319,17 @@ pub fn lookup<'a>(config: &'a Value, key: &str) -> Option<&'a Value> {
     config.get(section)?.get(name)
 }
 
+/// The config file's `text` with `classify.model` set to `model`; comments and the rest of the
+/// file stay as written.
+pub fn with_model(text: &str, model: Model) -> Result<String> {
+    let mut doc: toml_edit::DocumentMut = text.parse().context("parsing the config file")?;
+    doc["classify"]["model"] = toml_edit::value(model.name());
+    let text = doc.to_string();
+    let config: Config = toml::from_str(&text).context("the config file after setting the model")?;
+    ensure!(config.classify.model == model, "classify.model did not take; set it by hand");
+    Ok(text)
+}
+
 impl Config {
     /// Reads `path`. A missing file at the default location means all defaults;
     /// a missing file anywhere else is an error.
@@ -363,6 +385,29 @@ mod tests {
         assert_eq!(c.trigger.ratio, 4.0);
         assert_eq!(c.trigger.hang_ms, 800);
         assert_eq!(c.web.listen, "127.0.0.1:8377");
+    }
+
+    #[test]
+    fn model_is_chosen_by_name() {
+        assert_eq!(Config::default().classify.model, Model::Yamnet);
+        let c: Config = toml::from_str("[classify]\nmodel = \"ced-tiny\"\n").unwrap();
+        assert_eq!(c.classify.model, Model::CedTiny);
+        assert!(toml::from_str::<Config>("[classify]\nmodel = \"ced\"\n").is_err());
+    }
+
+    #[test]
+    fn setting_the_model_keeps_the_rest_of_the_file() {
+        let file = "# mine\n[classify]\nmatch_threshold = 0.9 # tuned\n\n[web]\nenabled = false\n";
+        let text = with_model(file, Model::CedTiny).unwrap();
+        assert!(text.contains("# mine") && text.contains("match_threshold = 0.9 # tuned"), "{text}");
+        let c: Config = toml::from_str(&text).unwrap();
+        assert_eq!((c.classify.model, c.classify.match_threshold, c.web.enabled), (Model::CedTiny, 0.9, false));
+
+        let back = with_model(&text, Model::Yamnet).unwrap();
+        assert_eq!(back.matches("model").count(), 1, "replaced, not added: {back}");
+        assert_eq!(toml::from_str::<Config>(&back).unwrap().classify.model, Model::Yamnet);
+        let fresh = with_model("", Model::CedTiny).unwrap();
+        assert_eq!(toml::from_str::<Config>(&fresh).unwrap().classify.model, Model::CedTiny);
     }
 
     #[test]
