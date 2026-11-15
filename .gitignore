@@ -1,3 +1,11 @@
 /target
 .DS_Store
 __pycache__/
+
+
+# Added by cargo
+#
+# already existing elements were commented out
+
+#/target
+/model/.cache
