@@ -193,6 +193,15 @@ pub struct LabelCount {
     pub exemplars: i64,
 }
 
+/// A taught label, and how often the clips tagged with it automatically were corrected later.
+#[derive(Debug, PartialEq, Serialize)]
+pub struct LabelStats {
+    pub label: String,
+    pub exemplars: i64,
+    pub matches: i64,
+    pub corrected: i64,
+}
+
 /// An audited clip, for `creak eval`.
 pub struct Audited {
     pub event_id: i64,
@@ -484,6 +493,67 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Every taught label, alphabetically, with its automatic tags and how many were corrected.
+    pub fn label_stats(&self) -> Result<Vec<LabelStats>> {
+        let mut matches: BTreeMap<String, MatchStats> =
+            self.match_stats()?.into_iter().map(|m| (m.label.clone(), m)).collect();
+        let stats = self.labels()?.into_iter().map(|l| {
+            let m = matches.remove(&l.label).unwrap_or_default();
+            LabelStats { label: l.label, exemplars: l.exemplars, matches: m.matches, corrected: m.corrected }
+        });
+        Ok(stats.collect())
+    }
+
+    /// Renames a taught label wherever it appears: exemplars, events, audits and classifications.
+    /// Renaming onto another label merges the two. Returns the number of exemplars renamed.
+    pub fn rename_label(&mut self, raw_label: &str, raw_to: &str) -> Result<usize> {
+        let label = classify::normalize_label(raw_label).context("empty or too long label")?;
+        let to = user_label(raw_to)?;
+        if label == classify::IGNORE || to == classify::IGNORE {
+            bail!("{} is reserved; relabel single events instead", classify::IGNORE);
+        }
+        if label == to {
+            bail!("{label:?} already has that name");
+        }
+        let tx = self.conn.transaction()?;
+        let renamed = tx.execute("UPDATE exemplars SET label = ?2 WHERE label = ?1", params![label, to])?;
+        if renamed == 0 {
+            bail!("no taught label {label:?}");
+        }
+        for sql in [
+            "UPDATE events SET label = ?2 WHERE label = ?1",
+            "UPDATE events SET nearest_label = ?2 WHERE nearest_label = ?1",
+            "UPDATE audits SET label = ?2 WHERE label = ?1",
+            "UPDATE classifications SET label = ?2 WHERE label = ?1",
+            "UPDATE classifications SET nearest_label = ?2 WHERE nearest_label = ?1",
+            "UPDATE classifications SET candidates = (
+                 SELECT json_group_array(CASE WHEN c.value ->> 0 = ?1 THEN json_set(c.value, '$[0]', ?2)
+                                              ELSE json(c.value) END)
+                 FROM json_each(candidates) c)
+             WHERE EXISTS (SELECT 1 FROM json_each(candidates) c WHERE c.value ->> 0 = ?1)",
+        ] {
+            tx.execute(sql, params![label, to])?;
+        }
+        tx.commit()?;
+        Ok(renamed)
+    }
+
+    /// Forgets a taught label: its exemplars are removed, so nothing is tagged with it any more.
+    /// Events keep the label they were given. Returns the number of exemplars removed.
+    pub fn delete_label(&self, raw_label: &str) -> Result<usize> {
+        let label = classify::normalize_label(raw_label).context("empty or too long label")?;
+        let deleted = self.conn.execute("DELETE FROM exemplars WHERE label = ?1", [&label])?;
+        if deleted == 0 {
+            bail!("no taught label {label:?}");
+        }
+        Ok(deleted)
+    }
+
+    /// Events that started at or after `since_ms`.
+    pub fn events_since(&self, since_ms: i64) -> Result<i64> {
+        Ok(self.conn.query_row("SELECT COUNT(*) FROM events WHERE ts >= ?1", [since_ms], |r| r.get(0))?)
+    }
+
     /// Events waiting in the Review view: pending ones and matches due for a check.
     pub fn review_count(&self) -> Result<i64> {
         Ok(self.conn.query_row(
@@ -561,7 +631,10 @@ impl Store {
     /// Automatic matches per label, most first, from the classifications that started an event.
     pub fn match_stats(&self) -> Result<Vec<MatchStats>> {
         let mut stmt = self.conn.prepare(
-            "SELECT c.label, e.similarity, e.status, e.checked
+            // A match that ends up with the label it was matched as, changed back or merged into
+            // it, was right after all.
+            "SELECT c.label, e.similarity, e.status = 'corrected' AND e.label <> c.label,
+                    CASE WHEN e.checked = 'wrong' AND e.label = c.label THEN 'right' ELSE e.checked END
              FROM classifications c JOIN events e ON e.id = c.event_id
              WHERE c.status = 'match' AND c.id = (SELECT MIN(id) FROM classifications WHERE event_id = c.event_id)",
         )?;
@@ -569,18 +642,18 @@ impl Store {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, Option<f64>>(1)?,
-                r.get::<_, String>(2)?,
+                r.get::<_, bool>(2)?,
                 r.get::<_, Option<String>>(3)?,
             ))
         })?;
         // Per label: the stats, and the sampling weight of the right and of the wrong checks.
         let mut by_label: BTreeMap<String, (MatchStats, f64, f64)> = BTreeMap::new();
         for row in rows {
-            let (label, similarity, status, checked) = row?;
+            let (label, similarity, corrected, checked) = row?;
             let (stats, right_w, wrong_w) = by_label.entry(label.clone()).or_default();
             stats.label = label;
             stats.matches += 1;
-            stats.corrected += (status == "corrected") as i64;
+            stats.corrected += corrected as i64;
             let weight = classify::check_weight(similarity.unwrap_or_default() as f32);
             match checked.as_deref() {
                 Some("right") => (stats.right, *right_w) = (stats.right + 1, *right_w + weight),
@@ -932,7 +1005,7 @@ mod tests {
                 patches: &[],
                 top_sounds: &[],
                 decision: &decision,
-                candidates: &[],
+                candidates: &[(label.into(), similarity, cause)],
                 settings: "{}",
                 classify_ms: 1,
                 mix: &[],
@@ -1020,6 +1093,70 @@ mod tests {
         assert_eq!((door.label.as_str(), door.matches, door.corrected, door.right, door.wrong), ("door", 4, 1, 2, 1));
         assert!((door.precision.unwrap() - 11.0 / 12.0).abs() < 1e-9);
         assert_eq!((stats[1].label.as_str(), stats[1].matches, stats[1].precision), ("bell", 1, None));
+    }
+
+    fn label_names(store: &Store) -> Vec<(String, i64)> {
+        store.labels().unwrap().into_iter().map(|l| (l.label, l.exemplars)).collect()
+    }
+
+    #[test]
+    fn renaming_a_label_renames_it_everywhere_and_can_merge_two() {
+        let mut store = temp_store();
+        let door = insert(&store, now_ms(), "door", &[1.0]);
+        store.label_event(door, "door").unwrap();
+        let gate = insert(&store, now_ms(), "gate", &[1.0]);
+        store.label_event(gate, "gate").unwrap();
+        let matched = insert_match(&store, "door", 0.9, door, false);
+        store.audit(matched, Some("door")).unwrap();
+        let called_gate = insert_match(&store, "door", 0.86, door, true);
+        store.label_event(called_gate, "gate").unwrap();
+
+        assert_eq!(store.rename_label(" Door ", "Front  Door").unwrap(), 1);
+        let e = store.event(matched).unwrap().unwrap();
+        assert_eq!((e.label.as_str(), e.nearest_label.as_deref()), ("front door", Some("front door")));
+        assert_eq!(store.audited().unwrap()[0].label, "front door");
+        assert_eq!(classifications(&store)[0].2, "front door");
+        let (nearest, candidates): (String, String) = store
+            .conn
+            .query_row("SELECT nearest_label, candidates FROM classifications", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((nearest.as_str(), candidates.as_str()), ("front door", r#"[["front door",0.9,1]]"#));
+
+        assert_eq!(store.rename_label("gate", "front door").unwrap(), 2);
+        assert_eq!(label_names(&store), vec![("front door".into(), 3)]);
+        // The match corrected to gate now carries the label it was matched as: it was right.
+        let m = &store.match_stats().unwrap()[0];
+        assert_eq!((m.matches, m.corrected, m.right, m.wrong), (2, 0, 1, 0));
+        assert!(store.rename_label("gate", "door").is_err(), "no longer taught");
+        assert!(store.rename_label("front door", "front door").is_err());
+        assert!(store.rename_label("front door", "silence").is_err());
+        assert!(store.rename_label("front door", "ignore").is_err(), "reserved");
+        let ignored = insert(&store, now_ms(), "fan", &[1.0]);
+        store.label_event(ignored, "ignore").unwrap();
+        assert!(store.rename_label("ignore", "fan").is_err(), "reserved");
+    }
+
+    #[test]
+    fn label_stats_count_corrected_matches_and_deleting_a_label_forgets_it() {
+        let mut store = temp_store();
+        let door = insert(&store, now_ms(), "door", &[1.0]);
+        store.label_event(door, "door").unwrap();
+        let kept = insert_match(&store, "door", 0.9, door, false);
+        let wrong = insert_match(&store, "door", 0.9, door, false);
+        store.label_event(wrong, "gate").unwrap();
+        let stats = |label: &str, exemplars, matches, corrected| LabelStats {
+            label: label.into(),
+            exemplars,
+            matches,
+            corrected,
+        };
+        assert_eq!(store.label_stats().unwrap(), vec![stats("door", 1, 2, 1), stats("gate", 1, 0, 0)]);
+
+        assert_eq!(store.delete_label("Door").unwrap(), 1);
+        assert_eq!(label_names(&store), vec![("gate".into(), 1)]);
+        assert_eq!(store.event(kept).unwrap().unwrap().label, "door", "events keep their label");
+        assert!(!store.event(door).unwrap().unwrap().exemplar);
+        assert!(store.delete_label("door").is_err());
     }
 
     #[test]

@@ -19,7 +19,7 @@
   body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
   header { display: flex; align-items: center; gap: 16px; padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 1; }
   header h1 { font-size: 17px; margin: 0; letter-spacing: .02em; }
-  nav { display: flex; gap: 4px; }
+  nav { display: flex; flex-wrap: wrap; gap: 4px; }
   nav button { background: none; border: 0; color: var(--muted); padding: 6px 10px; border-radius: 6px; font: inherit; cursor: pointer; }
   nav button.on { color: var(--text); background: var(--chip); }
   .badge { background: var(--accent); color: #fff; border-radius: 9px; padding: 0 6px; font-size: 12px; margin-left: 4px; }
@@ -82,6 +82,7 @@
     <button data-view="review">Review<span class="badge" id="pending-badge" hidden></span></button>
     <button data-view="events">Events</button>
     <button data-view="audit">Audit</button>
+    <button data-view="labels">Labels</button>
     <button data-view="live">Live</button>
     <button data-view="settings">Settings</button>
   </nav>
@@ -122,6 +123,14 @@
       <tbody id="matches-body"></tbody>
     </table>
     <p class="hint">Review asks "right?" about every automatic tag below 0.9 similarity and one in ten above. Precision weighs each answer by how often its kind was sampled.</p>
+  </section>
+
+  <section id="view-labels" hidden>
+    <p class="hint">Everything creak has been taught. Renaming a label to one that exists merges the two. Deleting a label stops its taught clips being examples, so nothing is tagged with it any more; past events keep it.</p>
+    <table>
+      <thead><tr><th>Label</th><th>Examples</th><th>Automatic tags</th><th>Corrected later</th><th></th></tr></thead>
+      <tbody id="labels-body"></tbody>
+    </table>
   </section>
 
   <section id="view-live" hidden>
@@ -453,6 +462,38 @@ $('f-status').addEventListener('change', () => loadEvents(false));
 $('f-label').addEventListener('change', () => loadEvents(false));
 $('more').addEventListener('click', () => loadEvents(true));
 
+// ---- labels
+async function loadLabels() {
+  const { stats } = await api('/api/labels?stats=1');
+  $('labels-body').innerHTML = stats.length ? stats.map((l) => `
+    <tr data-label="${esc(l.label)}" data-exemplars="${l.exemplars}">
+      <td>${esc(l.label)}</td>
+      <td>${l.exemplars}</td>
+      <td>${l.matches}</td>
+      <td>${l.matches ? `${l.corrected} (${pct(l.corrected / l.matches)})` : '–'}</td>
+      <td><div class="row">${l.label === 'ignore' ? '' : '<button class="act" data-rename>Rename</button>'}<button class="act" data-delete>Delete</button></div></td>
+    </tr>`).join('')
+    : '<tr><td colspan="5" class="hint">Nothing taught yet. Every clip you confirm or correct in Review teaches its label.</td></tr>';
+}
+$('labels-body').addEventListener('click', async (ev) => {
+  const row = ev.target.closest('tr[data-label]');
+  if (!row) return;
+  const label = row.dataset.label;
+  try {
+    if (ev.target.closest('[data-rename]')) {
+      const to = prompt(`New name for "${label}". The name of another label merges the two.`, label);
+      if (!to || !to.trim() || to.trim() === label) return;
+      await api('/api/labels/rename', { method: 'POST', body: JSON.stringify({ label, to }) });
+    } else if (ev.target.closest('[data-delete]')) {
+      const forget = `Forget "${label}"? Its ${row.dataset.exemplars} taught clips stop being examples, so nothing is tagged "${label}" any more, and those older than the retention time are deleted.`;
+      if (!confirm(forget)) return;
+      await api('/api/labels/delete', { method: 'POST', body: JSON.stringify({ label }) });
+    } else return;
+  } catch (_) { return; }
+  refreshLabels();
+  loadLabels();
+});
+
 // ---- live
 let liveFrame = 0, levels = [], live = null, liveTimer = null;
 async function pollLive() {
@@ -602,6 +643,7 @@ function show(name) {
   if (name === 'review') loadReview();
   if (name === 'events') loadEvents(false);
   if (name === 'audit') loadAudit().catch(() => {});
+  if (name === 'labels') loadLabels().catch(() => {});
   if (name === 'settings') loadSettings().catch(() => {});
   if (name === 'live') { loadTuning().catch(() => {}); pollLive(); liveTimer = setInterval(pollLive, 250); }
   try { localStorage.setItem('creak-view', name); } catch (_) {}

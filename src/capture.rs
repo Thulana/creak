@@ -1,11 +1,16 @@
 //! Microphone input: opens the device, downmixes to mono and hands raw chunks to the
 //! processing thread, which resamples them to 16 kHz.
 
-use crate::trigger::SAMPLE_RATE;
+use crate::config;
+use crate::trigger::{self, FRAME, SAMPLE_RATE, Trigger};
 use anyhow::{Context, Result, anyhow, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, FromSample, Sample, SampleFormat, SizedSample, Stream};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::time::Duration;
+
+/// `creak calibrate` prints a meter line every this many 20 ms frames.
+const METER_EVERY_FRAMES: u32 = 25;
 
 pub struct Input {
     /// Keeps the stream alive; capture stops when this is dropped.
@@ -30,6 +35,50 @@ pub fn list_devices() -> Result<()> {
     }
     println!("\n* = default. Put an id in [audio] device to use it.");
     Ok(())
+}
+
+/// `creak calibrate`: twice a second, the loudest level of the last half second, the ambient
+/// level and the open line, from the trigger the daemon would run. Runs until stopped.
+pub fn calibrate(device: &str, trigger_config: &config::Trigger) -> Result<()> {
+    let input = open(device)?;
+    println!(
+        "{} at {} Hz. The ambient level is the quietest tenth of the last 5 minutes. Ctrl-C stops.",
+        input.name, input.rate
+    );
+    let mut resampler = Resampler::new(input.rate);
+    let mut trigger = Trigger::new(trigger_config);
+    let (mut pending, mut resampled) = (Vec::new(), Vec::new());
+    let (mut loudest, mut frames) = (f32::NEG_INFINITY, 0u32);
+    loop {
+        let chunk = input.chunks.recv_timeout(Duration::from_secs(10)).context("no audio from the device for 10 s")?;
+        resampled.clear();
+        resampler.process(&chunk, &mut resampled);
+        pending.extend_from_slice(&resampled);
+        let whole = pending.len() / FRAME * FRAME;
+        for frame in pending[..whole].as_chunks::<FRAME>().0 {
+            let level = trigger::level_db(frame);
+            trigger.push(level);
+            loudest = loudest.max(level);
+            frames += 1;
+            if frames.is_multiple_of(METER_EVERY_FRAMES) {
+                let (open_db, _) = trigger.thresholds_db();
+                println!("{}", meter_line(loudest, trigger.ambient_db(), open_db, trigger.is_recording()));
+                loudest = f32::NEG_INFINITY;
+            }
+        }
+        pending.drain(..whole);
+    }
+}
+
+/// The numbers, and a bar from -100 to 0 dBFS with the open line marked `|`.
+fn meter_line(level_db: f32, ambient_db: f32, open_db: f32, recording: bool) -> String {
+    const WIDTH: usize = 50;
+    let column = |db: f32| (((db + 100.0) / 100.0).clamp(0.0, 1.0) * WIDTH as f32) as usize;
+    let mut bar: Vec<char> = (0..WIDTH).map(|i| if i < column(level_db) { '#' } else { '.' }).collect();
+    bar[column(open_db).min(WIDTH - 1)] = '|';
+    let bar: String = bar.into_iter().collect();
+    let clip = if recording { "  ● clip" } else { "" };
+    format!("{level_db:>6.1} dBFS  ambient {ambient_db:>6.1}  opens above {open_db:>6.1}  {bar}{clip}")
 }
 
 fn find_device(name: &str) -> Result<Device> {
@@ -208,6 +257,14 @@ mod tests {
             let level = rms(&out[1000..15000]);
             assert!((level - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.02, "{rate}: {level}");
         }
+    }
+
+    #[test]
+    fn the_meter_marks_the_open_line() {
+        let bar = format!("{}|{}{}", "#".repeat(24), "#".repeat(5), ".".repeat(20));
+        let line = meter_line(-40.0, -60.0, -50.4, true);
+        assert_eq!(line, format!(" -40.0 dBFS  ambient  -60.0  opens above  -50.4  {bar}  ● clip"));
+        assert!(meter_line(-120.0, -60.0, -50.0, false).ends_with(&format!("{}|{}", ".".repeat(25), ".".repeat(24))));
     }
 
     #[test]

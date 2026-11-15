@@ -2,6 +2,7 @@ mod capture;
 mod classify;
 mod config;
 mod daemon;
+mod doctor;
 mod embed;
 mod eval;
 mod setup;
@@ -53,12 +54,38 @@ enum Command {
     Skip { id: i64 },
     /// Score tagging against the clips you audited, and compare candidate matching changes.
     Eval,
+    /// What waits for an answer, and where to give it.
+    Review,
+    /// Taught labels: their examples and how often their automatic tags were corrected.
+    Labels {
+        #[command(subcommand)]
+        action: Option<LabelAction>,
+    },
+    /// Live meter: the microphone level, the ambient level and the line a sound has to cross.
+    Calibrate {
+        /// A device id from `creak devices`, instead of the one in the config file.
+        #[arg(long)]
+        device: Option<String>,
+    },
+    /// Check the config, storage, model, service, web UI and microphone.
+    Doctor,
     /// Stop and remove the service; keeps config and data unless --purge (root).
     Uninstall {
         #[arg(long)]
         purge: bool,
     },
 }
+
+#[derive(Subcommand)]
+enum LabelAction {
+    /// Rename a label everywhere; renaming it to another label merges the two.
+    Rename { label: String, to: String },
+    /// Forget a label: its taught clips stop being examples, so nothing is tagged with it any more.
+    Delete { label: String },
+}
+
+/// `creak review` lists at most this many of the events waiting.
+const REVIEW_LIST: i64 = 20;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -107,6 +134,58 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Eval => eval::run(&config::Config::load(&cli.config)?),
+        Command::Review => {
+            let config = config::Config::load(&cli.config)?;
+            let store = store::Store::open(&config.storage.dir)?;
+            let waiting = store.events(&store::Filter { review: true, limit: REVIEW_LIST, ..Default::default() })?;
+            for e in &waiting {
+                print_question(e, store.dir());
+            }
+            let count = store.review_count()?;
+            if count == 0 {
+                println!("Nothing waits for review.");
+                return Ok(());
+            }
+            let listed = if count > REVIEW_LIST { format!(", the {REVIEW_LIST} newest above") } else { String::new() };
+            match setup::web_url(&config.web) {
+                Some(url) => println!("{count} waiting for review{listed}. Play and answer them in the web UI: {url}"),
+                None => println!(
+                    "{count} waiting for review{listed}. Answer with `creak label <id> <label>` (the same label \
+                     confirms it), `creak label <id> ignore` or `creak skip <id>`."
+                ),
+            }
+            Ok(())
+        }
+        Command::Labels { action } => {
+            let mut store = open_store(&cli.config)?;
+            match action {
+                None => print_labels(&store.label_stats()?),
+                Some(LabelAction::Rename { label, to }) => {
+                    let n = store.rename_label(&label, &to)?;
+                    let to = classify::normalize_label(&to).unwrap_or(to);
+                    println!("renamed {label:?} to {to:?}; taught clips with it: {n}");
+                }
+                Some(LabelAction::Delete { label }) => {
+                    let n = store.delete_label(&label)?;
+                    println!("forgot {label:?}; taught clips that are no longer examples: {n}");
+                }
+            }
+            Ok(())
+        }
+        Command::Calibrate { device } => {
+            let file = config::Config::load(&cli.config)?;
+            // The trigger as the daemon runs it: with the settings changed in the web UI.
+            let overrides = store::Store::open(&file.storage.dir).and_then(|s| s.overrides());
+            let config = match overrides.and_then(|o| file.with_overrides(&o)) {
+                Ok(config) => config,
+                Err(e) => {
+                    eprintln!("using the config file without the web UI's settings: {e:#}");
+                    file
+                }
+            };
+            capture::calibrate(device.as_deref().unwrap_or(&config.audio.device), &config.trigger)
+        }
+        Command::Doctor => doctor::run(&cli.config),
     }
 }
 
@@ -114,16 +193,52 @@ fn open_store(config_path: &std::path::Path) -> Result<store::Store> {
     store::Store::open(&config::Config::load(config_path)?.storage.dir)
 }
 
-fn print_event(e: &store::Event, dir: &std::path::Path) {
-    let time = chrono::DateTime::from_timestamp_millis(e.ts)
+fn local_time(ts: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ts)
         .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+fn clip_text(e: &store::Event, dir: &std::path::Path) -> String {
+    e.clip_path.as_ref().map(|c| format!("  {}", dir.join(c).display())).unwrap_or_default()
+}
+
+fn print_event(e: &store::Event, dir: &std::path::Path) {
+    let time = local_time(e.ts);
     let nearest = match (&e.nearest_label, e.similarity) {
         (Some(l), Some(s)) => format!("  nearest {l} {s:.2}"),
         _ => String::new(),
     };
-    let clip = e.clip_path.as_ref().map(|c| format!("  {}", dir.join(c).display())).unwrap_or_default();
+    let clip = clip_text(e, dir);
     println!("{:>6}  {time}  {:<9}  {:<20}{nearest}{clip}", e.id, e.status, e.label);
+}
+
+/// An event waiting for review, asked as the Review view asks it.
+fn print_question(e: &store::Event, dir: &std::path::Path) {
+    let question = if e.status == "match" { format!("{}, right?", e.label) } else { format!("{}?", e.label) };
+    let note = match (&e.conflict, &e.nearest_label) {
+        (Some(c), Some(nearest)) if classify::normalize_label(c).as_ref() == Some(&e.label) => {
+            format!("  came in over {nearest}")
+        }
+        (Some(c), _) => format!("  the model hears {c}"),
+        (None, _) => String::new(),
+    };
+    println!("{:>6}  {}  {question:<24}{note}{}", e.id, local_time(e.ts), clip_text(e, dir));
+}
+
+fn print_labels(labels: &[store::LabelStats]) {
+    if labels.is_empty() {
+        println!("Nothing taught yet: every clip you confirm or correct teaches its label.");
+        return;
+    }
+    println!("{:<24} {:>8} {:>8} {:>10}", "label", "examples", "matches", "corrected");
+    for l in labels {
+        let corrected = match l.matches {
+            0 => "–".to_string(),
+            n => format!("{} ({:.0} %)", l.corrected, 100.0 * l.corrected as f64 / n as f64),
+        };
+        println!("{:<24} {:>8} {:>8} {:>10}", l.label, l.exemplars, l.matches, corrected);
+    }
 }
 
 fn parse_age(s: &str) -> Result<i64> {
