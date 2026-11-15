@@ -93,7 +93,7 @@ Scenes last for minutes or hours, so the trigger is the wrong tool: the ambient 
 ### 3.5 Storage and privacy
 
 - `events(id, ts, duration_ms, peak_db, ambient_db, label, status, similarity, nearest_label, top_classes, clip_path, embedding)`
-- `exemplars(id, event_id, label, embedding, clip_path, created_ts)`
+- `exemplars(id, event_id, label, embedding, created_ts)`; the clip is the event's.
 - `labels(name, kind)` arrives with scenes; until then labels are derived from exemplars.
 - Clips will contain conversations. They never leave the machine.
 - Clips that are not exemplars are deleted after `retention_days` (default 14) or when `max_clip_mb` is reached. Exemplar clips are kept, so they can be re-embedded if the model changes.
