@@ -58,6 +58,15 @@
   canvas { width: 100%; height: 260px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; display: block; }
   .rec { color: var(--bad); font-weight: 600; }
   .err { background: var(--panel); border: 1px solid var(--bad); color: var(--bad); padding: 10px 14px; border-radius: 10px; margin-bottom: 12px; }
+  .mode { margin-left: auto; font: inherit; font-size: 13px; padding: 4px 12px; border-radius: 14px; border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; }
+  .mode.active { color: var(--ok); border-color: var(--ok); }
+  .mode.deaf { color: var(--muted); }
+  .settings h2 { font-size: 15px; margin: 20px 0 2px; }
+  .setting { display: grid; grid-template-columns: 170px 1fr; gap: 2px 14px; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .setting .hint { grid-column: 2; margin: 0; }
+  .setting.changed label { font-weight: 600; }
+  .setting input[type=number] { width: 110px; font: inherit; padding: 5px 8px; border-radius: 7px; border: 1px solid var(--line); background: var(--panel); color: var(--text); }
+  @media (max-width: 640px) { .setting { grid-template-columns: 1fr; } .setting .hint { grid-column: 1; } }
   .wide-only { }
   @media (max-width: 640px) { .wide-only { display: none; } header { flex-wrap: wrap; } }
 </style>
@@ -69,7 +78,9 @@
     <button data-view="review">Review<span class="badge" id="pending-badge" hidden></span></button>
     <button data-view="events">Events</button>
     <button data-view="live">Live</button>
+    <button data-view="settings">Settings</button>
   </nav>
+  <button class="mode" id="mode" hidden></button>
 </header>
 <main>
   <div class="err" id="error" hidden></div>
@@ -111,6 +122,13 @@
       <label>Ambient floor <input type="range" id="t-floor" min="-90" max="-20" step="1"><output id="o-floor"></output></label>
       <div class="row"><span class="hint" id="t-source"></span><button class="act" id="t-reset" hidden>Reset to config file</button></div>
     </div>
+  </section>
+
+  <section id="view-settings" hidden>
+    <p class="hint">Changes apply at once and override the config file until reset. The switch at the top right is the mode: active records sounds, deaf records nothing.</p>
+    <div class="settings" id="settings-list"></div>
+    <p><button class="act" id="s-reset" hidden>Reset all to the config file</button></p>
+    <p class="hint" id="s-file-only"></p>
   </section>
 </main>
 <datalist id="known-labels"></datalist>
@@ -312,25 +330,27 @@ async function pollLive() {
     const measured = live.measured_ambient_db;
     $('l-ambient-note').textContent = measured != null && measured < live.ambient_db
       ? `ambient dBFS · floor; room measures ${fmtDb(measured)}` : 'ambient dBFS';
-    showTuning(live);
+    showMode(live.mode);
     $('l-open').textContent = fmtDb(live.open_db);
-    $('l-state').innerHTML = live.error ? '<span class="rec">no audio</span>' : live.recording ? '<span class="rec">● recording</span>' : 'listening';
+    $('l-state').innerHTML = live.error ? '<span class="rec">no audio</span>' : live.mode === 'deaf' ? 'deaf, not recording'
+      : live.recording ? '<span class="rec">● recording</span>' : 'listening';
     $('live-error').hidden = !live.error;
     $('live-error').textContent = live.error ? 'Microphone problem (retrying every 10 s): ' + live.error : '';
     $('l-device').textContent = live.device ? `${live.device} @ ${live.device_rate} Hz` : 'no audio yet';
     draw();
   } catch (_) {}
 }
-// Sliders follow the daemon's values unless one is being dragged.
-let dragging = false;
+// The sliders are three of the settings; changing one saves it as the Settings view does.
+const TUNING = { 't-ratio': 'trigger.ratio', 't-close': 'trigger.close_ratio', 't-floor': 'trigger.ambient_floor_db' };
 const dbOver = (ratio) => '+' + (20 * Math.log10(ratio)).toFixed(1) + ' dB';
-function showTuning(live, force) {
-  const t = live.tuning;
-  if (!t || (dragging && !force)) return;
-  $('t-ratio').value = t.ratio; $('t-close').value = t.close_ratio; $('t-floor').value = t.ambient_floor_db;
+async function loadTuning() { showTuning(await api('/api/settings')); }
+function showTuning(s) {
+  const fields = Object.fromEntries(s.fields.map((f) => [f.key, f]));
+  for (const [id, key] of Object.entries(TUNING)) $(id).value = fields[key].value;
   updateOutputs();
-  $('t-source').textContent = live.tuned ? 'Set here; overrides the config file.' : 'From the config file.';
-  $('t-reset').hidden = !live.tuned;
+  const tuned = Object.values(TUNING).some((key) => fields[key].overridden);
+  $('t-source').textContent = tuned ? 'Changed in the web UI; overrides the config file.' : 'From the config file.';
+  $('t-reset').hidden = !tuned;
 }
 function updateOutputs() {
   const r = Number($('t-ratio').value), c = Number($('t-close').value);
@@ -338,20 +358,20 @@ function updateOutputs() {
   $('o-close').textContent = `× ${c.toFixed(1)} (${dbOver(c)})`;
   $('o-floor').textContent = `${$('t-floor').value} dBFS`;
 }
-async function sendTuning() {
-  const ratio = Number($('t-ratio').value);
-  const close_ratio = Math.min(Number($('t-close').value), ratio - 0.1);
-  const body = { ratio, close_ratio, ambient_floor_db: Number($('t-floor').value) };
-  try { showTuning(Object.assign(live || {}, await api('/api/trigger', { method: 'POST', body: JSON.stringify(body) })), true); } catch (_) {}
+async function sendTuning(patch) {
+  try { showTuning(await api('/api/settings', { method: 'PATCH', body: JSON.stringify(patch) })); }
+  catch (e) { loadTuning().then(() => showError(e.message)).catch(() => {}); }
 }
-for (const id of ['t-ratio', 't-close', 't-floor']) {
-  const el = $(id);
-  el.addEventListener('input', () => { dragging = true; updateOutputs(); });
-  el.addEventListener('change', async () => { await sendTuning(); dragging = false; });
+for (const [id, key] of Object.entries(TUNING)) {
+  $(id).addEventListener('input', updateOutputs);
+  $(id).addEventListener('change', () => {
+    const patch = { [key]: Number($(id).value) };
+    const ratio = Number($('t-ratio').value);
+    if (Number($('t-close').value) >= ratio) patch['trigger.close_ratio'] = Math.round((ratio - 0.1) * 10) / 10;
+    sendTuning(patch);
+  });
 }
-$('t-reset').addEventListener('click', async () => {
-  try { showTuning(Object.assign(live || {}, await api('/api/trigger', { method: 'DELETE' })), true); } catch (_) {}
-});
+$('t-reset').addEventListener('click', () => sendTuning(Object.fromEntries(Object.values(TUNING).map((key) => [key, null]))));
 
 function draw() {
   const c = $('meter'), dpr = window.devicePixelRatio || 1;
@@ -375,6 +395,63 @@ function draw() {
   g.setLineDash([]);
 }
 
+// ---- mode
+let mode = null;
+function showMode(m) {
+  if (!m) return;
+  mode = m;
+  const b = $('mode');
+  b.hidden = false;
+  b.className = 'mode ' + m;
+  b.textContent = m === 'deaf' ? '○ Deaf' : '● Active';
+  b.title = m === 'deaf' ? 'Recording nothing. Click to start listening.' : 'Listening for sounds. Click to stop recording (deaf).';
+}
+async function refreshMode() { showMode((await api('/api/mode')).mode); }
+$('mode').addEventListener('click', async () => {
+  const next = mode === 'deaf' ? 'active' : 'deaf';
+  try { showMode((await api('/api/mode', { method: 'POST', body: JSON.stringify({ mode: next }) })).mode); } catch (_) {}
+});
+
+// ---- settings
+const SECTIONS = { trigger: 'Recording', classify: 'Tagging', storage: 'Storage' };
+const fmtSetting = (f, v) => v == null ? '–' : Number(v).toFixed(f.step >= 1 ? 0 : Math.round(-Math.log10(f.step)));
+async function loadSettings() { renderSettings(await api('/api/settings')); }
+function renderSettings(s) {
+  showMode(s.mode);
+  let html = '', section = null;
+  for (const f of s.fields) {
+    const sec = f.key.split('.')[0];
+    if (sec !== section) { section = sec; html += `<h2>${esc(SECTIONS[sec] || sec)}</h2>`; }
+    html += `
+      <div class="setting ${f.overridden ? 'changed' : ''}">
+        <label for="s-${esc(f.key)}">${esc(f.name)}</label>
+        <div class="row">
+          <input type="number" id="s-${esc(f.key)}" data-key="${esc(f.key)}" min="${f.min}" max="${f.max}" step="${f.step}" value="${fmtSetting(f, f.value)}">
+          <span class="hint">${esc(f.unit)}</span>
+          ${f.overridden ? `<button class="chip" data-reset="${esc(f.key)}" title="Go back to the config file's value">↺ file: ${fmtSetting(f, f.file)}</button>` : ''}
+        </div>
+        <p class="hint">${esc(f.help)}</p>
+      </div>`;
+  }
+  $('settings-list').innerHTML = html;
+  $('s-reset').hidden = !s.fields.some((f) => f.overridden);
+  const fo = s.file_only;
+  $('s-file-only').textContent = `Only in the config file, applied after a restart: device ${fo['audio.device']}, data ${fo['storage.dir']}, web UI ${fo['web.listen']}.`;
+}
+async function patchSettings(patch, method = 'PATCH') {
+  try { renderSettings(await api('/api/settings', { method, body: patch && JSON.stringify(patch) })); }
+  catch (e) { loadSettings().then(() => showError(e.message)).catch(() => {}); }
+}
+$('settings-list').addEventListener('change', (ev) => {
+  const input = ev.target.closest('[data-key]');
+  if (input && input.value !== '') patchSettings({ [input.dataset.key]: Number(input.value) });
+});
+$('settings-list').addEventListener('click', (ev) => {
+  const reset = ev.target.closest('[data-reset]');
+  if (reset) patchSettings({ [reset.dataset.reset]: null });
+});
+$('s-reset').addEventListener('click', () => patchSettings(null, 'DELETE'));
+
 // ---- navigation
 let view = null;
 function show(name) {
@@ -384,15 +461,17 @@ function show(name) {
   clearInterval(liveTimer);
   if (name === 'review') loadReview();
   if (name === 'events') loadEvents(false);
-  if (name === 'live') { pollLive(); liveTimer = setInterval(pollLive, 250); }
+  if (name === 'settings') loadSettings().catch(() => {});
+  if (name === 'live') { loadTuning().catch(() => {}); pollLive(); liveTimer = setInterval(pollLive, 250); }
   try { localStorage.setItem('creak-view', name); } catch (_) {}
 }
 document.querySelectorAll('nav button').forEach((b) => b.addEventListener('click', () => show(b.dataset.view)));
 let startView = 'review';
 try { startView = localStorage.getItem('creak-view') || 'review'; } catch (_) {}
 refreshLabels().catch(() => {});
+refreshMode().catch(() => {});
 show(startView);
-setInterval(() => { refreshLabels().catch(() => {}); if (view === 'review' && !document.activeElement.matches('input')) loadReview().catch(() => {}); }, 15000);
+setInterval(() => { refreshLabels().catch(() => {}); refreshMode().catch(() => {}); if (view === 'review' && !document.activeElement.matches('input')) loadReview().catch(() => {}); }, 15000);
 </script>
 </body>
 </html>

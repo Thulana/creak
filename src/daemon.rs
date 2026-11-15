@@ -2,10 +2,10 @@
 
 use crate::capture::{self, Resampler};
 use crate::classify;
-use crate::config::{Config, Tuning};
+use crate::config::{Config, Mode, Overrides};
 use crate::embed::{self, Tagger};
 use crate::store::{NewEvent, Store, now_ms};
-use crate::trigger::{self, Event, FRAME, SAMPLE_RATE, Trigger};
+use crate::trigger::{self, Event, FRAME, FRAME_MS, SAMPLE_RATE, Trigger};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -14,8 +14,8 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const PREROLL_SAMPLES: usize = SAMPLE_RATE as usize * 3 / 2;
-const RING_SAMPLES: usize = SAMPLE_RATE as usize * 2;
+/// Ring buffer room beyond the pre-roll, for the run that opened the clip (`min_ms` is at most 2 s).
+const RING_EXTRA_SAMPLES: usize = SAMPLE_RATE as usize * 2;
 /// Context kept before the trigger point when embedding, so the onset is not cut off.
 const ONSET_MARGIN_SAMPLES: usize = SAMPLE_RATE as usize / 10;
 const LIVE_FRAMES: usize = 30 * 1000 / trigger::FRAME_MS as usize;
@@ -39,45 +39,62 @@ pub struct Live {
     pub error: Option<String>,
     /// The 10th-percentile room level before the floor is applied.
     pub measured_ambient_db: Option<f32>,
-    /// Trigger values in effect, and whether they come from the Live view rather than the config file.
-    pub tuning: Tuning,
-    pub tuned: bool,
-    /// Set by the web UI after changing `tuning`; the capture loop applies it.
-    #[serde(skip)]
-    pub retune: bool,
 }
 
 pub type SharedLive = Arc<Mutex<Live>>;
+
+/// What the web UI can change while the daemon runs.
+pub struct Settings {
+    /// The config file with `overrides` applied.
+    pub config: Config,
+    pub overrides: Overrides,
+    pub mode: Mode,
+    /// Bumped on every change, so the capture loop knows to apply it.
+    pub version: u64,
+}
+
+pub type SharedSettings = Arc<Mutex<Settings>>;
 
 pub struct Clip {
     pub samples: Vec<f32>,
     /// Where the triggering sound starts within `samples`; everything before is pre-roll.
     pub onset: usize,
+    /// Where the sound is over within `samples`; everything after is tail.
+    pub sound_end: usize,
     pub ts: i64,
     pub peak_db: f32,
     pub ambient_db: f32,
 }
 
-pub fn run(config: Config) -> Result<()> {
-    let store = Store::open(&config.storage.dir)?;
+pub fn run(file: Config) -> Result<()> {
+    file.validate().context("config file")?;
+    let store = Store::open(&file.storage.dir)?;
     let tagger = Tagger::load()?;
-    eprintln!("model loaded; storage at {}", config.storage.dir.display());
-    let live = SharedLive::default();
-    let file_tuning = config.trigger.tuning();
-    {
-        let mut l = live.lock().unwrap();
-        l.tuning = file_tuning;
-        if let Some(t) = store.trigger_tuning()?.filter(|t| config.trigger.with_tuning(*t).validate().is_ok()) {
-            eprintln!("using trigger values set in the web UI: {t:?}");
-            (l.tuning, l.tuned) = (t, true);
+    eprintln!("model loaded; storage at {}", file.storage.dir.display());
+    let mut overrides = store.overrides()?;
+    let config = match file.with_overrides(&overrides) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("ignoring the settings changed in the web UI: {e:#}");
+            overrides.clear();
+            file.clone()
         }
+    };
+    if !overrides.is_empty() {
+        eprintln!("using settings changed in the web UI: {}", serde_json::Value::Object(overrides.clone()));
     }
+    let mode = store.mode()?;
+    if mode == Mode::Deaf {
+        eprintln!("deaf: nothing is recorded until the mode is switched to active");
+    }
+    let settings = Arc::new(Mutex::new(Settings { config, overrides, mode, version: 0 }));
+    let live = SharedLive::default();
 
-    if config.web.enabled {
-        let web_store = Store::open(&config.storage.dir)?;
-        let (web, live) = (config.web.clone(), live.clone());
+    if file.web.enabled {
+        let web_store = Store::open(&file.storage.dir)?;
+        let (file, live, settings) = (file.clone(), live.clone(), settings.clone());
         std::thread::spawn(move || {
-            if let Err(e) = crate::web::serve(&web, file_tuning, web_store, live) {
+            if let Err(e) = crate::web::serve(&file, web_store, live, settings) {
                 eprintln!("web UI stopped: {e:#}");
                 std::process::exit(1);
             }
@@ -85,20 +102,20 @@ pub fn run(config: Config) -> Result<()> {
     }
 
     let (clips_tx, clips_rx) = channel();
-    let classify_config = config.clone();
-    std::thread::spawn(move || classify_loop(&classify_config, store, tagger, clips_rx));
+    let classify_settings = settings.clone();
+    std::thread::spawn(move || classify_loop(&classify_settings, store, tagger, clips_rx));
 
     // A missing or failing microphone is retried rather than fatal, so the web UI stays up
     // and shows what is wrong.
     loop {
-        let error = match capture::open(&config.audio.device) {
+        let error = match capture::open(&file.audio.device) {
             Ok(input) => {
                 eprintln!("capturing from {} at {} Hz", input.name, input.rate);
                 {
                     let mut l = live.lock().unwrap();
                     (l.device, l.device_rate, l.error) = (input.name.clone(), input.rate, None);
                 }
-                capture_loop(&config, &input.chunks, input.rate, &live, &clips_tx).unwrap_err()
+                capture_loop(&settings, &input.chunks, input.rate, &live, &clips_tx).unwrap_err()
             }
             Err(e) => e,
         };
@@ -109,15 +126,17 @@ pub fn run(config: Config) -> Result<()> {
 }
 
 fn capture_loop(
-    config: &Config,
+    settings: &SharedSettings,
     chunks: &Receiver<Vec<f32>>,
     rate: u32,
     live: &SharedLive,
     clips: &Sender<Clip>,
 ) -> Result<()> {
     let mut resampler = Resampler::new(rate);
-    let mut trigger = Trigger::new(&config.trigger.with_tuning(live.lock().unwrap().tuning));
-    let mut ring: VecDeque<f32> = VecDeque::with_capacity(RING_SAMPLES);
+    let mut trigger = Trigger::new(&settings.lock().unwrap().config.trigger);
+    let mut version = None;
+    let mut pre_roll = 0;
+    let mut ring: VecDeque<f32> = VecDeque::new();
     let mut pending: Vec<f32> = Vec::new();
     let mut resampled = Vec::new();
     let mut clip: Option<Clip> = None;
@@ -129,14 +148,27 @@ fn capture_loop(
             Err(RecvTimeoutError::Timeout) => bail!("no audio from the device for {}s", STALL.as_secs()),
             Err(RecvTimeoutError::Disconnected) => bail!("audio stream closed"),
         };
+        {
+            let s = settings.lock().unwrap();
+            if version != Some(s.version) {
+                version = Some(s.version);
+                trigger.retune(&s.config.trigger);
+                trigger.set_armed(s.mode == Mode::Active);
+                if s.mode == Mode::Deaf {
+                    clip = None;
+                }
+                pre_roll = s.config.trigger.pre_roll_ms.div_ceil(FRAME_MS) as usize * FRAME;
+            }
+        }
         resampled.clear();
         resampler.process(&chunk, &mut resampled);
         pending.extend_from_slice(&resampled);
 
         let whole = pending.len() / FRAME * FRAME;
         for frame in pending[..whole].as_chunks::<FRAME>().0 {
-            if ring.len() + FRAME > RING_SAMPLES {
-                ring.drain(..ring.len() + FRAME - RING_SAMPLES);
+            let ring_samples = pre_roll + RING_EXTRA_SAMPLES;
+            if ring.len() + FRAME > ring_samples {
+                ring.drain(..ring.len() + FRAME - ring_samples);
             }
             ring.extend(frame);
             if let Some(c) = clip.as_mut() {
@@ -148,19 +180,22 @@ fn capture_loop(
                 Some(Event::Open { start }) => {
                     // The ring ends at frame `frame_index`; the run started `back` samples ago.
                     let back = ((frame_index + 1 - start) as usize * FRAME).min(ring.len());
-                    let take = (back + PREROLL_SAMPLES).min(ring.len());
+                    let take = (back + pre_roll).min(ring.len());
                     let samples: Vec<f32> = ring.range(ring.len() - take..).copied().collect();
                     let ts = now_ms() - (take as i64 * 1000 / SAMPLE_RATE as i64);
                     clip = Some(Clip {
                         samples,
                         onset: take - back,
+                        sound_end: 0,
                         ts,
                         peak_db: level,
                         ambient_db: trigger.ambient_db(),
                     });
                 }
-                Some(Event::Close { peak_db, ambient_db, .. }) => {
+                Some(Event::Close { end, sound_end, peak_db, ambient_db }) => {
                     if let Some(mut c) = clip.take() {
+                        // `samples` ends with the frame before `end`.
+                        c.sound_end = c.samples.len().saturating_sub((end - sound_end) as usize * FRAME);
                         c.peak_db = peak_db;
                         c.ambient_db = ambient_db;
                         clips.send(c).context("classifier thread stopped")?;
@@ -171,10 +206,6 @@ fn capture_loop(
             frame_index += 1;
 
             let mut l = live.lock().unwrap();
-            if l.retune {
-                trigger.retune(&config.trigger.with_tuning(l.tuning));
-                l.retune = false;
-            }
             let (open_db, close_db) = trigger.thresholds_db();
             if l.levels.len() == LIVE_FRAMES {
                 l.levels.pop_front();
@@ -184,16 +215,17 @@ fn capture_loop(
             l.ambient_db = trigger.ambient_db();
             l.measured_ambient_db = trigger.measured_ambient_db();
             (l.open_db, l.close_db) = (open_db, close_db);
-            l.recording = trigger.is_open();
+            l.recording = trigger.is_recording();
         }
         pending.drain(..whole);
     }
 }
 
-fn classify_loop(config: &Config, store: Store, tagger: Tagger, clips: Receiver<Clip>) {
+fn classify_loop(settings: &SharedSettings, store: Store, tagger: Tagger, clips: Receiver<Clip>) {
     let mut last_expiry: Option<Instant> = None;
     let mut last: Option<Latest> = None;
     loop {
+        let config = settings.lock().unwrap().config.clone();
         if last_expiry.is_none_or(|t| t.elapsed() >= EXPIRE_EVERY) {
             match store.expire(config.storage.retention_days) {
                 Ok(0) => {}
@@ -204,7 +236,8 @@ fn classify_loop(config: &Config, store: Store, tagger: Tagger, clips: Receiver<
         }
         match clips.recv_timeout(Duration::from_secs(60)) {
             Ok(clip) => {
-                if let Err(e) = handle_clip(config, &store, &tagger, &clip, &mut last) {
+                let config = settings.lock().unwrap().config.clone();
+                if let Err(e) = handle_clip(&config, &store, &tagger, &clip, &mut last) {
                     eprintln!("clip at {}: {e:#}", clip.ts);
                 }
             }
@@ -214,12 +247,13 @@ fn classify_loop(config: &Config, store: Store, tagger: Tagger, clips: Receiver<
     }
 }
 
-/// The part of the clip that is embedded: from just before the onset to the end, widened
-/// into the pre-roll when that is shorter than one model patch.
+/// The part of the clip that is embedded: from just before the onset to the end of the sound,
+/// widened into the pre-roll, and then the tail, when that is shorter than one model patch.
 pub fn analysis_window(clip: &Clip) -> &[f32] {
     let start = clip.onset.saturating_sub(ONSET_MARGIN_SAMPLES);
-    let start = start.min(clip.samples.len().saturating_sub(embed::MIN_SAMPLES));
-    &clip.samples[start..]
+    let start = start.min(clip.sound_end.saturating_sub(embed::MIN_SAMPLES));
+    let end = clip.sound_end.max((start + embed::MIN_SAMPLES).min(clip.samples.len()));
+    &clip.samples[start..end]
 }
 
 /// The most recent event and when it ended, for grouping the next clip into it.
@@ -235,7 +269,7 @@ fn handle_clip(config: &Config, store: &Store, tagger: &Tagger, clip: &Clip, las
     let sounds = classify::sounds(tagger.top_classes(&tags.scores, 20));
     let top = &sounds[..sounds.len().min(3)];
     let c = &config.classify;
-    let decision = classify::decide(&tags.embedding, &store.exemplars()?, top, c.match_threshold, c.suggest_threshold);
+    let decision = classify::decide(&tags.embedding, &store.exemplars()?, top, c);
     if decision.status == classify::Status::Silent {
         eprintln!("dropped a clip with nothing but silence or room tone");
         return Ok(());
@@ -310,20 +344,37 @@ fn write_wav(path: &Path, samples: &[f32]) -> Result<()> {
 mod tests {
     use super::*;
 
+    const PRE_ROLL: usize = 24_000;
+
     fn clip(len: usize, onset: usize) -> Clip {
-        Clip { samples: vec![0.0; len], onset, ts: 0, peak_db: 0.0, ambient_db: 0.0 }
+        Clip { samples: vec![0.0; len], onset, sound_end: len, ts: 0, peak_db: 0.0, ambient_db: 0.0 }
+    }
+
+    fn shared(config: &Config) -> SharedSettings {
+        let settings = Settings { config: config.clone(), overrides: Overrides::new(), mode: Mode::Active, version: 0 };
+        Arc::new(Mutex::new(settings))
     }
 
     #[test]
     fn window_skips_preroll_for_long_sounds() {
-        let c = clip(PREROLL_SAMPLES + 40_000, PREROLL_SAMPLES);
+        let c = clip(PRE_ROLL + 40_000, PRE_ROLL);
         assert_eq!(analysis_window(&c).len(), 40_000 + ONSET_MARGIN_SAMPLES);
     }
 
     #[test]
+    fn window_skips_the_tail() {
+        let c = Clip { sound_end: PRE_ROLL + 40_000, ..clip(PRE_ROLL + 72_000, PRE_ROLL) };
+        let window = analysis_window(&c).as_ptr_range();
+        let samples = c.samples.as_ptr_range();
+        assert_eq!(window.end, samples.start.wrapping_add(PRE_ROLL + 40_000));
+    }
+
+    #[test]
     fn window_widens_into_preroll_for_short_sounds() {
-        let c = clip(PREROLL_SAMPLES + 4_000, PREROLL_SAMPLES);
+        let c = clip(PRE_ROLL + 4_000, PRE_ROLL);
         assert_eq!(analysis_window(&c).len(), embed::MIN_SAMPLES);
+        let without_preroll = Clip { sound_end: 4_000, ..clip(40_000, 0) };
+        assert_eq!(analysis_window(&without_preroll).len(), embed::MIN_SAMPLES);
     }
 
     #[test]
@@ -338,7 +389,14 @@ mod tests {
             .samples::<i16>()
             .map(|s| s.unwrap() as f32 / 32768.0)
             .collect();
-        let at = |ts: i64| Clip { samples: sound.clone(), onset: 0, ts, peak_db: -20.0, ambient_db: -60.0 };
+        let at = |ts: i64| Clip {
+            samples: sound.clone(),
+            onset: 0,
+            sound_end: sound.len(),
+            ts,
+            peak_db: -20.0,
+            ambient_db: -60.0,
+        };
         let mut last = None;
         // 2.5 s clips: the second starts 2 s after the first ends, the third 60 s later.
         for ts in [0, 4_500, 67_000] {
@@ -361,7 +419,7 @@ mod tests {
         let tags = tagger.tag(&sound).unwrap();
         let heard = classify::sounds(tagger.top_classes(&tags.scores, 20)).remove(0);
         assert!(
-            heard.1 >= classify::MIN_CONFLICT_SCORE && heard.0 != "Music",
+            heard.1 >= config.classify.conflict_score && heard.0 != "Music",
             "fixture must be heard as a sound: {heard:?}"
         );
 
@@ -386,7 +444,8 @@ mod tests {
             .unwrap();
         store.label_event(music, "music").unwrap();
 
-        let clip = Clip { samples: sound, onset: 0, ts: 1_003_000, peak_db: -20.0, ambient_db: -60.0 };
+        let clip =
+            Clip { sound_end: sound.len(), samples: sound, onset: 0, ts: 1_003_000, peak_db: -20.0, ambient_db: -60.0 };
         let mut last = Some(Latest { id: music, end_ts: 1_002_500 });
         handle_clip(&config, &store, &tagger, &clip, &mut last).unwrap();
         let newest = &store.events(&crate::store::Filter { limit: 1, ..Default::default() }).unwrap()[0];
@@ -397,8 +456,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Quiet noise, then the fixture sound, then quiet again: one clip, tagged and stored as
-    /// pending; after labelling it, the same sound is a match.
+    /// Quiet noise, then the fixture sound, then quiet again: one clip with pre-roll and tail,
+    /// tagged and stored as pending; after labelling it, the same sound is a match. Deaf, the
+    /// same audio gives no clip.
     #[test]
     fn pipeline_from_audio_to_event() {
         let dir = std::env::temp_dir().join(format!("creak-pipeline-{}", std::process::id()));
@@ -419,21 +479,26 @@ mod tests {
             .map(|s| s.unwrap() as f32 / 32768.0)
             .collect();
 
-        let feed = |audio: Vec<f32>| {
+        let feed = |audio: Vec<f32>, mode: Mode| {
             let (chunks_tx, chunks_rx) = channel();
             let (clips_tx, clips_rx) = channel();
             for chunk in audio.chunks(1000) {
                 chunks_tx.send(chunk.to_vec()).unwrap();
             }
             drop(chunks_tx);
-            let err = capture_loop(&config, &chunks_rx, SAMPLE_RATE, &SharedLive::default(), &clips_tx).unwrap_err();
+            let settings = shared(&config);
+            settings.lock().unwrap().mode = mode;
+            let err = capture_loop(&settings, &chunks_rx, SAMPLE_RATE, &SharedLive::default(), &clips_tx).unwrap_err();
             assert!(err.to_string().contains("closed"));
             clips_rx.try_iter().collect::<Vec<Clip>>()
         };
-        let audio = [noise(16_000 * 6), sound.clone(), noise(16_000 * 3)].concat();
-        let clips = feed(audio.clone());
+        let audio = [noise(16_000 * 6), sound.clone(), noise(16_000 * 5)].concat();
+        assert!(feed(audio.clone(), Mode::Deaf).is_empty());
+        let clips = feed(audio.clone(), Mode::Active);
         assert_eq!(clips.len(), 1);
-        assert_eq!(clips[0].onset, PREROLL_SAMPLES);
+        assert_eq!(clips[0].onset, PRE_ROLL);
+        let tail = clips[0].samples.len() - clips[0].sound_end;
+        assert_eq!(tail, config.trigger.tail_ms as usize * 16, "{} samples past the sound", tail);
 
         let mut store = Store::open(&dir).unwrap();
         let tagger = Tagger::load().unwrap();
@@ -443,7 +508,7 @@ mod tests {
         assert!(dir.join(first.clip_path.as_ref().unwrap()).exists());
 
         store.label_event(first.id, "chirp").unwrap();
-        handle_clip(&config, &store, &tagger, &feed(audio).remove(0), &mut None).unwrap();
+        handle_clip(&config, &store, &tagger, &feed(audio, Mode::Active).remove(0), &mut None).unwrap();
         let second = &store.events(&crate::store::Filter { limit: 1, ..Default::default() }).unwrap()[0];
         assert_eq!((second.status.as_str(), second.label.as_str()), ("match", "chirp"));
         let _ = std::fs::remove_dir_all(dir);

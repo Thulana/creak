@@ -26,14 +26,18 @@ pub fn level_db(frame: &[f32]) -> f32 {
 pub enum Event {
     /// A clip opened. `start` is the first frame of the run that crossed the threshold.
     Open { start: u64 },
-    /// The clip closed. `end` is one past its last frame.
-    Close { end: u64, peak_db: f32, ambient_db: f32 },
+    /// The clip closed. `end` is one past its last frame and `sound_end` one past the frame at
+    /// which the sound was over; the frames in between are the tail.
+    Close { end: u64, sound_end: u64, peak_db: f32, ambient_db: f32 },
 }
 
+/// In `Tail` the sound is over but recording goes on until `until`; a new sound before then
+/// reopens the clip.
 #[derive(Debug, Clone, Copy)]
 enum State {
     Idle { above: u32 },
     Open { start: u64, below: u32, peak_db: f32, ambient_db: f32 },
+    Tail { start: u64, sound_end: u64, until: u64, above: u32, peak_db: f32, ambient_db: f32 },
     Cooldown { until: u64 },
 }
 
@@ -42,9 +46,12 @@ pub struct Trigger {
     close_over_db: f32,
     min_frames: u32,
     hang_frames: u32,
+    tail_frames: u64,
+    min_clip_frames: u64,
     max_frames: u64,
     cooldown_frames: u64,
     floor_db: f32,
+    armed: bool,
     history: VecDeque<u16>,
     histogram: Vec<u32>,
     frame: u64,
@@ -58,9 +65,12 @@ impl Trigger {
             close_over_db: 0.0,
             min_frames: 0,
             hang_frames: 0,
+            tail_frames: 0,
+            min_clip_frames: 0,
             max_frames: 0,
             cooldown_frames: 0,
             floor_db: 0.0,
+            armed: true,
             history: VecDeque::with_capacity(AMBIENT_WINDOW_FRAMES),
             histogram: vec![0; BINS],
             frame: 0,
@@ -77,6 +87,8 @@ impl Trigger {
         self.close_over_db = 20.0 * c.close_ratio.log10();
         self.min_frames = frames(c.min_ms);
         self.hang_frames = frames(c.hang_ms);
+        self.tail_frames = c.tail_ms.div_ceil(FRAME_MS) as u64;
+        self.min_clip_frames = (c.min_clip_s * 1000 / FRAME_MS) as u64;
         self.max_frames = frames(c.max_clip_s * 1000) as u64;
         self.cooldown_frames = (c.cooldown_s * 1000 / FRAME_MS) as u64;
         self.floor_db = c.ambient_floor_db;
@@ -106,8 +118,18 @@ impl Trigger {
         (ambient + self.open_over_db, ambient + self.close_over_db)
     }
 
-    pub fn is_open(&self) -> bool {
-        matches!(self.state, State::Open { .. })
+    /// True while a clip is being recorded, its tail included.
+    pub fn is_recording(&self) -> bool {
+        matches!(self.state, State::Open { .. } | State::Tail { .. })
+    }
+
+    /// A disarmed trigger keeps measuring the ambient level but opens no clip, and drops the
+    /// one it is recording.
+    pub fn set_armed(&mut self, armed: bool) {
+        if !armed {
+            self.state = State::Idle { above: 0 };
+        }
+        self.armed = armed;
     }
 
     pub fn push(&mut self, level_db: f32) -> Option<Event> {
@@ -121,7 +143,7 @@ impl Trigger {
         let (next, event) = match self.state {
             State::Cooldown { until } if n + 1 >= until => (State::Idle { above: 0 }, None),
             State::Cooldown { .. } => (self.state, None),
-            State::Idle { above } if warm && level_db >= open_db => {
+            State::Idle { above } if warm && self.armed && level_db >= open_db => {
                 let above = above + 1;
                 if above >= self.min_frames {
                     let start = n + 1 - above as u64;
@@ -134,16 +156,39 @@ impl Trigger {
             State::Open { start, below, peak_db, ambient_db } => {
                 let below = if level_db < close_db { below + 1 } else { 0 };
                 let peak_db = peak_db.max(level_db);
-                if below >= self.hang_frames || n + 1 - start >= self.max_frames {
-                    let close = Event::Close { end: n + 1, peak_db, ambient_db };
-                    (State::Cooldown { until: n + 1 + self.cooldown_frames }, Some(close))
+                let end = n + 1;
+                if end - start >= self.max_frames {
+                    self.close(end, end, peak_db, ambient_db)
+                } else if below >= self.hang_frames {
+                    let until = (end + self.tail_frames).max(start + self.min_clip_frames).min(start + self.max_frames);
+                    if until <= end {
+                        self.close(end, end, peak_db, ambient_db)
+                    } else {
+                        (State::Tail { start, sound_end: end, until, above: 0, peak_db, ambient_db }, None)
+                    }
                 } else {
                     (State::Open { start, below, peak_db, ambient_db }, None)
+                }
+            }
+            State::Tail { start, sound_end, until, above, peak_db, ambient_db } => {
+                let above = if level_db >= open_db { above + 1 } else { 0 };
+                let peak_db = peak_db.max(level_db);
+                if above >= self.min_frames {
+                    (State::Open { start, below: 0, peak_db, ambient_db }, None)
+                } else if n + 1 >= until {
+                    self.close(n + 1, sound_end, peak_db, ambient_db)
+                } else {
+                    (State::Tail { start, sound_end, until, above, peak_db, ambient_db }, None)
                 }
             }
         };
         self.state = next;
         event
+    }
+
+    fn close(&self, end: u64, sound_end: u64, peak_db: f32, ambient_db: f32) -> (State, Option<Event>) {
+        let close = Event::Close { end, sound_end, peak_db, ambient_db };
+        (State::Cooldown { until: end + self.cooldown_frames }, Some(close))
     }
 
     fn record(&mut self, level_db: f32) {
@@ -196,16 +241,66 @@ mod tests {
         assert!(matches!(feed(&mut t, -25.0, 3)[..], [Event::Open { .. }]));
     }
 
+    fn warm(c: config::Trigger) -> Trigger {
+        let mut t = Trigger::new(&c);
+        assert!(feed(&mut t, -50.0, WARMUP_FRAMES).is_empty());
+        t
+    }
+
     #[test]
     fn one_burst_gives_one_clip() {
-        let mut t = trigger();
-        assert!(feed(&mut t, -50.0, WARMUP_FRAMES).is_empty());
+        let mut t = warm(config::Trigger { tail_ms: 0, min_clip_s: 0, ..Default::default() });
         let events = [feed(&mut t, -30.0, 10), feed(&mut t, -50.0, 200)].concat();
         let start = WARMUP_FRAMES as u64;
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0], Event::Open { start });
-        // closes after hang_ms (800 ms = 40 frames) below the close line
-        assert_eq!(events[1], Event::Close { end: start + 10 + 40, peak_db: -30.0, ambient_db: -50.0 });
+        // the sound is over after hang_ms (800 ms = 40 frames) below the close line
+        let end = start + 10 + 40;
+        let close = Event::Close { end, sound_end: end, peak_db: -30.0, ambient_db: -50.0 };
+        assert_eq!(events, vec![Event::Open { start }, close]);
+    }
+
+    #[test]
+    fn the_tail_keeps_recording_after_the_sound() {
+        let mut t = warm(config::Trigger { tail_ms: 1000, min_clip_s: 0, ..Default::default() });
+        let events = [feed(&mut t, -30.0, 10), feed(&mut t, -50.0, 200)].concat();
+        let start = WARMUP_FRAMES as u64;
+        let sound_end = start + 10 + 40;
+        let close = Event::Close { end: sound_end + 50, sound_end, peak_db: -30.0, ambient_db: -50.0 };
+        assert_eq!(events, vec![Event::Open { start }, close]);
+        assert!(!t.is_recording());
+    }
+
+    #[test]
+    fn a_short_sound_runs_to_the_shortest_clip() {
+        // defaults: 2 s tail, but at least 4 s (200 frames) from the onset
+        let mut t = warm(config::Trigger::default());
+        let events = [feed(&mut t, -30.0, 10), feed(&mut t, -50.0, 300)].concat();
+        let start = WARMUP_FRAMES as u64;
+        let close = Event::Close { end: start + 200, sound_end: start + 50, peak_db: -30.0, ambient_db: -50.0 };
+        assert_eq!(events, vec![Event::Open { start }, close]);
+    }
+
+    #[test]
+    fn a_sound_in_the_tail_joins_the_clip() {
+        let mut t = warm(config::Trigger { tail_ms: 2000, min_clip_s: 0, ..Default::default() });
+        // over at +50, then a second burst at +70 while the tail runs to +150
+        let events =
+            [feed(&mut t, -30.0, 10), feed(&mut t, -50.0, 60), feed(&mut t, -25.0, 10), feed(&mut t, -50.0, 300)]
+                .concat();
+        let start = WARMUP_FRAMES as u64;
+        let sound_end = start + 80 + 40;
+        let close = Event::Close { end: sound_end + 100, sound_end, peak_db: -25.0, ambient_db: -50.0 };
+        assert_eq!(events, vec![Event::Open { start }, close]);
+    }
+
+    #[test]
+    fn a_disarmed_trigger_drops_its_clip_and_opens_none() {
+        let mut t = warm(config::Trigger::default());
+        assert_eq!(feed(&mut t, -30.0, 10).len(), 1);
+        t.set_armed(false);
+        assert!(!t.is_recording());
+        assert!(feed(&mut t, -30.0, 300).is_empty());
+        t.set_armed(true);
+        assert!(matches!(feed(&mut t, -20.0, 3)[..], [Event::Open { .. }]));
     }
 
     #[test]
@@ -224,14 +319,14 @@ mod tests {
 
     #[test]
     fn long_noise_is_cut_at_max_and_cooled_down() {
-        let mut t = trigger();
-        feed(&mut t, -50.0, WARMUP_FRAMES);
-        let events = feed(&mut t, -20.0, 750 + 100 + 3);
+        let mut t = warm(config::Trigger::default());
+        let events = feed(&mut t, -20.0, 1500 + 100 + 3);
         let start = WARMUP_FRAMES as u64;
         assert_eq!(events[0], Event::Open { start });
-        assert!(matches!(events[1], Event::Close { end, .. } if end == start + 750));
+        // cut at max_clip_s (30 s = 1500 frames) with no tail, because the sound is still going
+        assert!(matches!(events[1], Event::Close { end, sound_end, .. } if end == start + 1500 && sound_end == end));
         // the next clip needs the 2 s cooldown and then min_ms (3 frames) above the line
-        assert_eq!(events[2], Event::Open { start: start + 750 + 100 });
+        assert_eq!(events[2], Event::Open { start: start + 1500 + 100 });
         assert_eq!(events.len(), 3);
     }
 }
