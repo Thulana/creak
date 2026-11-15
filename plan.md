@@ -202,7 +202,8 @@ creak events [--since 1d] [--label door] [--json]
 creak review                    # pending count, and the web UI URL if it is enabled
 creak label <event-id> <label|ignore>
 creak skip <event-id>           # answer without teaching; removes an exemplar
-creak eval                      # replay the audited clips (§3.8)
+creak eval [--model <name>]     # replay the audited clips (§3.8), optionally with another model
+creak model [<name>]            # list the models; with a name, set it in the config and restart
 creak labels                    # exemplar count and corrected-match rate per label
 creak labels rename <label> <new> | delete <label>
 creak teach <scene> --for 10m

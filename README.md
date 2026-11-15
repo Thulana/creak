@@ -88,7 +88,7 @@ Two models are built in. YAMNet is the default. CED-tiny scores higher on AudioS
 sudo -u creak creak eval --model ced-tiny
 ```
 
-To switch, set `model` under `[classify]` and restart. The daemon then analyses the clips it still has again with the new model, so what you taught carries over; events whose clip is already gone can no longer be labelled. The thresholds were set for YAMNet: check `match_threshold` against the sweep in `creak eval`.
+To switch, run `sudo creak model ced-tiny` (or set `model` under `[classify]` and restart). The daemon then analyses the clips it still has again with the new model, so what you taught carries over; events whose clip is already gone can no longer be labelled. The thresholds were set for YAMNet: check `match_threshold` against the sweep in `creak eval`.
 
 ## Configuration
 
@@ -145,7 +145,9 @@ creak skip <event-id>               answer without teaching; also removes a taug
 creak labels                        taught labels, with how often their automatic tags were corrected
 creak labels rename <label> <new>   rename everywhere; another label's name merges the two
 creak labels delete <label>         stop tagging with it; past events keep it
-creak eval                          score tagging against your audited clips
+creak eval [--model NAME]           score tagging against your audited clips
+creak model                         list the tagging models, the one in use marked
+sudo creak model <name>             switch model: sets it in the config file and restarts the service
 creak calibrate [--device ID]       live meter in the terminal: level, ambient, the line to cross
 creak doctor                        check config, disk, model, service, web UI and microphone
 sudo creak setup                    install or upgrade the service

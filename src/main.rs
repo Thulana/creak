@@ -10,7 +10,7 @@ mod store;
 mod trigger;
 mod web;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -73,6 +73,11 @@ enum Command {
     },
     /// Check the config, storage, model, service, web UI and microphone.
     Doctor,
+    /// List the tagging models, or switch to one: sets it in the config file and restarts the service.
+    Model {
+        /// The model to switch to.
+        model: Option<embed::Model>,
+    },
     /// Stop and remove the service; keeps config and data unless --purge (root).
     Uninstall {
         #[arg(long)]
@@ -190,7 +195,46 @@ fn main() -> Result<()> {
             capture::calibrate(device.as_deref().unwrap_or(&config.audio.device), &config.trigger)
         }
         Command::Doctor => doctor::run(&cli.config),
+        Command::Model { model: None } => {
+            print_models(config::Config::load(&cli.config)?.classify.model);
+            Ok(())
+        }
+        Command::Model { model: Some(model) } => select_model(&cli.config, model),
     }
+}
+
+/// Every built-in model, the configured one marked.
+fn print_models(current: embed::Model) {
+    use clap::ValueEnum;
+    for model in embed::Model::value_variants() {
+        let value = model.to_possible_value().expect("no model is hidden");
+        let help = value.get_help().map(ToString::to_string).unwrap_or_default();
+        let mark = if *model == current { "*" } else { " " };
+        println!("{mark} {:<10} {help}", value.get_name());
+    }
+    println!("`creak eval --model <name>` compares one on your audited clips; `sudo creak model <name>` switches.");
+}
+
+/// Sets the model in the config file, keeping the rest of it, and restarts the service.
+fn select_model(path: &std::path::Path, model: embed::Model) -> Result<()> {
+    if config::Config::load(path)?.classify.model == model {
+        println!("{} already uses {}", path.display(), model.name());
+        return Ok(());
+    }
+    let text = match std::fs::read_to_string(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        text => text.with_context(|| format!("reading {}", path.display()))?,
+    };
+    std::fs::write(path, config::with_model(&text, model)?)
+        .with_context(|| format!("writing {}; it needs sudo", path.display()))?;
+    println!("{} now uses {}", path.display(), model.name());
+    if setup::restart_if_running()? {
+        println!("restarted creak; it analyses the clips it still has again first (journalctl -u creak -f)");
+    } else {
+        println!("the service is not running; {} applies when creak next starts", model.name());
+    }
+    println!("The thresholds were set for YAMNet: `creak eval` shows how they do with {}.", model.name());
+    Ok(())
 }
 
 fn open_store(config_path: &std::path::Path) -> Result<store::Store> {
