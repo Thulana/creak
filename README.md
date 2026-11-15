@@ -80,6 +80,16 @@ Clips are deleted after a while, but what the model made of each one is kept for
 sudo -u creak creak eval
 ```
 
+## Choosing the model
+
+Two models are built in. YAMNet is the default. CED-tiny scores higher on AudioSet (mAP 0.481 against YAMNet's 0.306) and takes about twice the CPU time. To see how it does on your own sounds before switching, replay the audited clips with it:
+
+```sh
+sudo -u creak creak eval --model ced-tiny
+```
+
+To switch, set `model` under `[classify]` and restart. The daemon then analyses the clips it still has again with the new model, so what you taught carries over; events whose clip is already gone can no longer be labelled. The thresholds were set for YAMNet: check `match_threshold` against the sweep in `creak eval`.
+
 ## Configuration
 
 `/etc/creak/config.toml`. Every key is optional; these are the defaults:
@@ -101,6 +111,7 @@ pre_roll_ms = 1500        # audio kept from before the onset
 ambient_floor_db = -60    # ambient is the 10th percentile of the last 5 minutes, never below this
 
 [classify]
+model = "yamnet"          # or "ced-tiny"; see Choosing the model
 match_threshold = 0.85    # cosine similarity to a confirmed clip that applies its label; higher asks more often
 suggest_threshold = 0.60  # above this, the nearest label is proposed instead of the model's guess
 sound_score = 0.1         # the weakest model score that counts as a sound; a clip with none is dropped as silence
@@ -118,7 +129,7 @@ listen = "127.0.0.1:8377" # setup writes 0.0.0.0:8377 with a random token
 token = ""
 ```
 
-Everything in `[trigger]` and `[classify]`, and the two `[storage]` limits, can also be changed on the Settings page, which applies the change at once and overrides this file until reset. A change to the file itself needs a restart: `sudo systemctl restart creak`. Logs: `journalctl -u creak -f`.
+Everything in `[trigger]` and `[classify]` except `model`, and the two `[storage]` limits, can also be changed on the Settings page, which applies the change at once and overrides this file until reset. A change to the file itself needs a restart: `sudo systemctl restart creak`. Logs: `journalctl -u creak -f`.
 
 The web UI is meant for a home network or a VPN. Do not expose it to the internet.
 
@@ -157,8 +168,8 @@ cargo build --release
 cargo test --release
 ```
 
-The YAMNet model is converted once from the official weights by [model/convert.py](model/convert.py) and embedded in the binary; see [model/README.md](model/README.md).
+The YAMNet model is converted once from the official weights by [model/convert.py](model/convert.py), and CED-tiny from its Hugging Face release by [model/convert_ced.py](model/convert_ced.py). Both are embedded in the binary; see [model/README.md](model/README.md).
 
 ## Licence
 
-MIT, see [LICENSE](LICENSE). The embedded YAMNet weights are Apache-2.0 and the AudioSet class names CC BY-SA 4.0; see [NOTICE](NOTICE).
+MIT, see [LICENSE](LICENSE). The embedded YAMNet and CED-tiny weights are Apache-2.0 and the AudioSet class names CC BY-SA 4.0; see [NOTICE](NOTICE).
