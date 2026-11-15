@@ -81,7 +81,7 @@ impl Default for Trigger {
 
 impl Default for Classify {
     fn default() -> Self {
-        Self { match_threshold: 0.80, suggest_threshold: 0.60, group_gap_s: 10 }
+        Self { match_threshold: 0.85, suggest_threshold: 0.60, group_gap_s: 10 }
     }
 }
 

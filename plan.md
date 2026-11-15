@@ -191,7 +191,7 @@ cooldown_s = 2
 ambient_floor_db = -60
 
 [classify]
-match_threshold = 0.80
+match_threshold = 0.85
 suggest_threshold = 0.60
 group_gap_s = 10
 publish_pending = false
@@ -212,7 +212,7 @@ url = "mqtt://127.0.0.1:1883"
 discovery = true
 ```
 
-The two thresholds are starting values. Phase 0 measures the real similarity ranges and sets them.
+The two thresholds are starting values. On Phase 0 data, raising `match_threshold` from 0.80 to 0.85 cut wrong automatic tags from 3 of 32 to 2 of 29 for 3 more questions; the wrong matches left sit above 0.92 and come from mislabelled exemplars, which §3.8 addresses. The replay in Phase 1 sets the final values.
 
 ## 6. Repository layout
 

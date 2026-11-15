@@ -61,7 +61,7 @@ cooldown_s = 2
 ambient_floor_db = -60    # ambient is the 10th percentile of the last 5 minutes, never below this
 
 [classify]
-match_threshold = 0.80    # cosine similarity to a confirmed clip that applies its label
+match_threshold = 0.85    # cosine similarity to a confirmed clip that applies its label; higher asks more often
 suggest_threshold = 0.60  # above this, the nearest label is proposed instead of the model's guess
 group_gap_s = 10          # a same-label clip within this many seconds extends the previous event; 0 = off
 
