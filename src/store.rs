@@ -88,6 +88,13 @@ pub struct Filter {
     pub limit: i64,
 }
 
+struct KeptClip {
+    id: i64,
+    path: String,
+    exemplar: bool,
+    bytes: u64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct LabelCount {
     pub label: String,
@@ -271,12 +278,53 @@ impl Store {
         let expired: Vec<(i64, Option<String>)> =
             stmt.query_map([cutoff], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
         for (id, clip) in &expired {
-            if let Some(clip) = clip {
-                let _ = std::fs::remove_file(self.dir.join(clip));
-            }
-            self.conn.execute("UPDATE events SET clip_path = NULL, embedding = x'' WHERE id = ?1", [id])?;
+            self.drop_clip(*id, clip.as_deref())?;
         }
         Ok(expired.len())
+    }
+
+    /// Deletes the oldest clips that are not exemplars until all clips take at most `max_mb`.
+    pub fn cap_clips(&self, max_mb: u32) -> Result<usize> {
+        let clips = self.kept_clips()?;
+        let mut total: u64 = clips.iter().map(|c| c.bytes).sum();
+        let mut dropped = 0;
+        for clip in clips.iter().filter(|c| !c.exemplar) {
+            if total <= max_mb as u64 * 1_000_000 {
+                break;
+            }
+            self.drop_clip(clip.id, Some(&clip.path))?;
+            total -= clip.bytes;
+            dropped += 1;
+        }
+        Ok(dropped)
+    }
+
+    /// Bytes on disk of every clip still kept.
+    pub fn clip_bytes(&self) -> Result<u64> {
+        Ok(self.kept_clips()?.iter().map(|c| c.bytes).sum())
+    }
+
+    /// Clips on disk, oldest first.
+    fn kept_clips(&self) -> Result<Vec<KeptClip>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT e.id, e.clip_path, x.id IS NOT NULL FROM events e LEFT JOIN exemplars x ON x.event_id = e.id
+             WHERE e.clip_path IS NOT NULL ORDER BY e.ts",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let path: String = r.get(1)?;
+            let bytes = std::fs::metadata(self.dir.join(&path)).map_or(0, |m| m.len());
+            Ok(KeptClip { id: r.get(0)?, path, exemplar: r.get(2)?, bytes })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Deletes an event's clip and its embedding; the event row stays in the log.
+    fn drop_clip(&self, id: i64, clip: Option<&str>) -> Result<()> {
+        if let Some(clip) = clip {
+            let _ = std::fs::remove_file(self.dir.join(clip));
+        }
+        self.conn.execute("UPDATE events SET clip_path = NULL, embedding = x'' WHERE id = ?1", [id])?;
+        Ok(())
     }
 }
 
@@ -381,6 +429,28 @@ mod tests {
         assert!(store.label_event(dropped, "door").is_err());
         assert!(store.event(recent).unwrap().unwrap().clip_path.is_some());
         assert!(store.event(kept).unwrap().unwrap().clip_path.is_some());
+    }
+
+    #[test]
+    fn the_size_cap_deletes_the_oldest_clips_but_not_exemplars() {
+        let mut store = temp_store();
+        let clip = |store: &Store, ts: i64| {
+            let id = insert(store, ts, "door", &[1.0]);
+            let rel = format!("clips/{id}.wav");
+            std::fs::write(store.dir().join(&rel), vec![0u8; 400_000]).unwrap();
+            store.conn.execute("UPDATE events SET clip_path = ?1 WHERE id = ?2", params![rel, id]).unwrap();
+            id
+        };
+        let ids: Vec<i64> = (0..4).map(|i| clip(&store, 1_000 + i)).collect();
+        store.label_event(ids[0], "door").unwrap();
+        assert_eq!(store.clip_bytes().unwrap(), 1_600_000);
+        // 1.6 MB against a 1 MB cap: the oldest is taught, so the next two go
+        assert_eq!(store.cap_clips(1).unwrap(), 2);
+        let kept: Vec<bool> = ids.iter().map(|&id| store.event(id).unwrap().unwrap().clip_path.is_some()).collect();
+        assert_eq!(kept, vec![true, false, false, true]);
+        assert!(!store.dir().join(format!("clips/{}.wav", ids[1])).exists());
+        assert_eq!(store.clip_bytes().unwrap(), 800_000);
+        assert_eq!(store.cap_clips(1).unwrap(), 0);
     }
 
     #[test]

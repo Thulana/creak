@@ -21,7 +21,7 @@ const ONSET_MARGIN_SAMPLES: usize = SAMPLE_RATE as usize / 10;
 const LIVE_FRAMES: usize = 30 * 1000 / trigger::FRAME_MS as usize;
 const STALL: Duration = Duration::from_secs(10);
 const RETRY: Duration = Duration::from_secs(10);
-const EXPIRE_EVERY: Duration = Duration::from_secs(3600);
+const EXPIRE_EVERY: Duration = Duration::from_secs(600);
 
 /// What the Live view shows: recent frame levels and the current trigger lines.
 #[derive(Default, Serialize)]
@@ -231,6 +231,11 @@ fn classify_loop(settings: &SharedSettings, store: Store, tagger: Tagger, clips:
                 Ok(0) => {}
                 Ok(n) => eprintln!("expired {n} clips"),
                 Err(e) => eprintln!("expiring clips: {e:#}"),
+            }
+            match store.cap_clips(config.storage.max_clip_mb) {
+                Ok(0) => {}
+                Ok(n) => eprintln!("deleted the {n} oldest clips to stay under {} MB", config.storage.max_clip_mb),
+                Err(e) => eprintln!("capping clip space: {e:#}"),
             }
             last_expiry = Some(Instant::now());
         }

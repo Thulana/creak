@@ -94,6 +94,7 @@ group_gap_s = 10          # a same-label clip within this many seconds extends t
 [storage]
 dir = "/var/lib/creak"
 retention_days = 14       # clips that are not examples are deleted after this
+max_clip_mb = 2000        # beyond this, the oldest clips that are not examples are deleted first
 
 [web]
 enabled = true
@@ -101,7 +102,7 @@ listen = "127.0.0.1:8377" # setup writes 0.0.0.0:8377 with a random token
 token = ""
 ```
 
-Everything in `[trigger]` and `[classify]`, and `retention_days`, can also be changed on the Settings page, which applies the change at once and overrides this file until reset. A change to the file itself needs a restart: `sudo systemctl restart creak`. Logs: `journalctl -u creak -f`.
+Everything in `[trigger]` and `[classify]`, and the two `[storage]` limits, can also be changed on the Settings page, which applies the change at once and overrides this file until reset. A change to the file itself needs a restart: `sudo systemctl restart creak`. Logs: `journalctl -u creak -f`.
 
 The web UI is meant for a home network or a VPN. Do not expose it to the internet.
 

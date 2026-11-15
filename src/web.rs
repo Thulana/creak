@@ -72,7 +72,7 @@ fn handle(
         (Method::Get, ["api", "labels"]) => {
             json_reply(&json!({ "labels": store.labels()?, "pending": store.pending_count()? }))
         }
-        (Method::Get, ["api", "settings"]) => settings_reply(file, settings)?,
+        (Method::Get, ["api", "settings"]) => settings_reply(file, store, settings)?,
         (Method::Patch, ["api", "settings"]) => {
             let Ok(patch) = serde_json::from_str::<Overrides>(&read_body(request)?) else {
                 return Ok(text(400, "expected {\"section.name\": value, …}; null resets a setting"));
@@ -148,12 +148,13 @@ fn override_settings(file: &Config, store: &Store, settings: &SharedSettings, ov
         (s.config, s.overrides) = (config, overrides);
         s.version += 1;
     }
-    settings_reply(file, settings)
+    settings_reply(file, store, settings)
 }
 
-/// Every live setting with its range, help, value in effect and config-file value, plus the
-/// settings that only the config file can change.
-fn settings_reply(file: &Config, settings: &SharedSettings) -> Result<Reply> {
+/// Every live setting with its range, help, value in effect and config-file value, the
+/// settings that only the config file can change, and the space clips take now.
+fn settings_reply(file: &Config, store: &Store, settings: &SharedSettings) -> Result<Reply> {
+    let clip_mb = store.clip_bytes()? as f64 / 1e6;
     let s = settings.lock().unwrap();
     // Through a string, so f32 values read as written (0.85) rather than widened (0.8500000238).
     let as_written = |c: &Config| serde_json::from_str::<Value>(&serde_json::to_string(c)?);
@@ -170,6 +171,7 @@ fn settings_reply(file: &Config, settings: &SharedSettings) -> Result<Reply> {
         "fields": fields,
         "mode": s.mode,
         "file_only": { "audio.device": file.audio.device, "storage.dir": file.storage.dir, "web.listen": file.web.listen },
+        "clip_mb": clip_mb,
     })))
 }
 

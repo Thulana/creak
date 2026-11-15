@@ -433,6 +433,7 @@ function renderSettings(s) {
         <p class="hint">${esc(f.help)}</p>
       </div>`;
   }
+  html += `<p class="hint">Clips take ${s.clip_mb.toFixed(s.clip_mb < 10 ? 1 : 0)} MB now.</p>`;
   $('settings-list').innerHTML = html;
   $('s-reset').hidden = !s.fields.some((f) => f.overridden);
   const fo = s.file_only;
