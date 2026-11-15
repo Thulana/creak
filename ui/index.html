@@ -616,7 +616,7 @@ function renderSettings(s) {
   $('settings-list').innerHTML = html;
   $('s-reset').hidden = !s.fields.some((f) => f.overridden);
   const fo = s.file_only;
-  $('s-file-only').textContent = `Only in the config file, applied after a restart: device ${fo['audio.device']}, data ${fo['storage.dir']}, web UI ${fo['web.listen']}.`;
+  $('s-file-only').textContent = `Only in the config file, applied after a restart: device ${fo['audio.device']}, model ${fo['classify.model']}, data ${fo['storage.dir']}, web UI ${fo['web.listen']}.`;
 }
 async function patchSettings(patch, method = 'PATCH') {
   try { renderSettings(await api('/api/settings', { method, body: patch && JSON.stringify(patch) })); }

@@ -53,7 +53,11 @@ enum Command {
     /// Answer an event without teaching: it is no longer asked about and stops being an example.
     Skip { id: i64 },
     /// Score tagging against the clips you audited, and compare candidate matching changes.
-    Eval,
+    Eval {
+        /// Replay with this model instead of the one in the config file, to compare them.
+        #[arg(long)]
+        model: Option<embed::Model>,
+    },
     /// What waits for an answer, and where to give it.
     Review,
     /// Taught labels: their examples and how often their automatic tags were corrected.
@@ -133,7 +137,7 @@ fn main() -> Result<()> {
             print_event(&store.skip_event(id)?, store.dir());
             Ok(())
         }
-        Command::Eval => eval::run(&config::Config::load(&cli.config)?),
+        Command::Eval { model } => eval::run(&config::Config::load(&cli.config)?, model),
         Command::Review => {
             let config = config::Config::load(&cli.config)?;
             let store = store::Store::open(&config.storage.dir)?;

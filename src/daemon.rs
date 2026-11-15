@@ -4,7 +4,7 @@ use crate::capture::{self, Resampler};
 use crate::classify::{self, MixPart};
 use crate::config::{Config, Mode, Overrides};
 use crate::embed::{self, Tagger, Tags};
-use crate::store::{NewClassification, NewEvent, Store, now_ms};
+use crate::store::{NewClassification, NewEvent, Store, StoredClip, now_ms};
 use crate::trigger::{self, Event, FRAME, FRAME_MS, SAMPLE_RATE, Trigger};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -73,8 +73,8 @@ pub struct Clip {
 pub fn run(file: Config) -> Result<()> {
     file.validate().context("config file")?;
     let store = Store::open(&file.storage.dir)?;
-    let tagger = Tagger::load()?;
-    eprintln!("model loaded; storage at {}", file.storage.dir.display());
+    let tagger = Tagger::load(file.classify.model)?;
+    eprintln!("model {} loaded; storage at {}", file.classify.model.name(), file.storage.dir.display());
     let mut overrides = store.overrides()?;
     let config = match file.with_overrides(&overrides) {
         Ok(config) => config,
@@ -225,7 +225,11 @@ fn capture_loop(
     }
 }
 
-fn classify_loop(settings: &SharedSettings, store: Store, tagger: Tagger, clips: Receiver<Clip>) {
+fn classify_loop(settings: &SharedSettings, mut store: Store, tagger: Tagger, clips: Receiver<Clip>) {
+    let config = settings.lock().unwrap().config.clone();
+    if let Err(e) = reanalyse(&mut store, &tagger, &config) {
+        eprintln!("analysing stored clips again: {e:#}");
+    }
     let mut last_expiry: Option<Instant> = None;
     let mut last: Option<Latest> = None;
     loop {
@@ -254,6 +258,50 @@ fn classify_loop(settings: &SharedSettings, store: Store, tagger: Tagger, clips:
             Err(RecvTimeoutError::Disconnected) => return,
         }
     }
+}
+
+/// Analyses again, with the tagger's model, every event that still has its clip but was analysed
+/// by another model, so taught examples and new clips share one embedding space. Clips that fail
+/// stay with the old model, whose examples are not used, and are tried again at the next start.
+pub fn reanalyse(store: &mut Store, tagger: &Tagger, config: &Config) -> Result<usize> {
+    let model = tagger.model().name();
+    let dropped = store.drop_stale_embeddings(model)?;
+    if dropped > 0 {
+        eprintln!("{dropped} events without a clip cannot be analysed with {model} and can no longer be labelled");
+    }
+    let stale = store.stale_clips(model)?;
+    if stale.is_empty() {
+        return Ok(0);
+    }
+    eprintln!("analysing {} stored clips again with {model}", stale.len());
+    let mut done = 0;
+    for s in &stale {
+        let analysed = read_clip(store.dir(), s, config.trigger.pre_roll_ms)
+            .and_then(|clip| analyse(tagger, &clip, config.classify.sound_score));
+        match analysed {
+            Ok(a) => {
+                let top = &a.sounds[..a.sounds.len().min(3)];
+                store.reanalysed(s.event_id, model, &a.tags.embedding, top, &a.mix)?;
+                done += 1;
+            }
+            Err(e) => eprintln!("event {}: {e:#}", s.event_id),
+        }
+    }
+    eprintln!("analysed {done} of {} stored clips with {model}", stale.len());
+    Ok(done)
+}
+
+/// A kept clip read back from disk. Without a stored onset, the sound is taken to start after
+/// the pre-roll; without a stored end, to last to the end of the clip.
+pub fn read_clip(dir: &Path, s: &StoredClip, pre_roll_ms: u32) -> Result<Clip> {
+    let path = dir.join(&s.clip_path);
+    let reader = hound::WavReader::open(&path).with_context(|| format!("reading {}", path.display()))?;
+    let samples: Vec<f32> =
+        reader.into_samples::<i16>().map(|s| s.map(|s| s as f32 / 32768.0)).collect::<Result<_, _>>()?;
+    let at = |ms: i64| (ms.max(0) as usize * SAMPLE_RATE as usize / 1000).min(samples.len());
+    let onset = at(s.onset_ms.unwrap_or(pre_roll_ms as i64));
+    let sound_end = s.sound_end_ms.map_or(samples.len(), at).max(onset);
+    Ok(Clip { samples, onset, sound_end, ts: s.ts, peak_db: 0.0, ambient_db: 0.0 })
 }
 
 /// The part of the clip that is embedded: from just before the onset to the end of the sound,
@@ -318,7 +366,7 @@ fn handle_clip(config: &Config, store: &Store, tagger: &Tagger, clip: &Clip, las
     let c = &config.classify;
     let Analysis { window, tags, patches, sounds, background, mix } = analyse(tagger, clip, c.sound_score)?;
     let top = &sounds[..sounds.len().min(3)];
-    let exemplars = store.exemplars()?;
+    let exemplars = store.exemplars(tagger.model().name())?;
     let decision = classify::decide(&tags.embedding, &exemplars, top, &mix, c);
     let candidates = classify::candidates(&tags.embedding, &exemplars, 5);
     let classify_ms = started.elapsed().as_millis() as i64;
@@ -343,7 +391,14 @@ fn handle_clip(config: &Config, store: &Store, tagger: &Tagger, clip: &Clip, las
             eprintln!("event {}: extended with another {:?} clip", prev.id, decision.label);
             break 'event Some(prev.id);
         }
-        let found = Found { decision: &decision, top, embedding: &tags.embedding, candidates: &candidates, mix: &mix };
+        let found = Found {
+            decision: &decision,
+            top,
+            embedding: &tags.embedding,
+            candidates: &candidates,
+            mix: &mix,
+            model: tagger.model().name(),
+        };
         Some(new_event(store, clip, &found, last, started)?)
     };
 
@@ -356,7 +411,7 @@ fn handle_clip(config: &Config, store: &Store, tagger: &Tagger, clip: &Clip, las
         window_ms: (ms(window.start), ms(window.end)),
         peak_db: clip.peak_db,
         ambient_db: clip.ambient_db,
-        model: embed::MODEL_NAME,
+        model: tagger.model().name(),
         scores: &tags.scores,
         embedding: &tags.embedding,
         patches: &patches.iter().map(|p| p[..p.len().min(5)].to_vec()).collect::<Vec<_>>(),
@@ -378,6 +433,7 @@ struct Found<'a> {
     embedding: &'a [f32],
     candidates: &'a [(String, f32, i64)],
     mix: &'a [MixPart],
+    model: &'a str,
 }
 
 /// Starts an event for a clip that is not grouped into the previous one, keeping its audio
@@ -407,6 +463,7 @@ fn new_event(store: &Store, clip: &Clip, found: &Found, last: &mut Option<Latest
         nearest_event: found.candidates.first().map(|(.., event)| *event),
         mix: found.mix,
         check,
+        model: found.model,
     })?;
     if decision.status != classify::Status::Ignored {
         *last = Some(Latest { id, end_ts });
@@ -442,6 +499,7 @@ fn write_wav(path: &Path, samples: &[f32]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embed::Model;
 
     const PRE_ROLL: usize = 24_000;
 
@@ -480,7 +538,7 @@ mod tests {
         let mut config = Config::default();
         config.storage.dir = dir.clone();
         let store = Store::open(&dir).unwrap();
-        let tagger = Tagger::load().unwrap();
+        let tagger = Tagger::load(Model::Yamnet).unwrap();
         let sound: Vec<f32> = hound::WavReader::open(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synth.wav"))
             .unwrap()
             .samples::<i16>()
@@ -515,7 +573,7 @@ mod tests {
         let mut config = Config::default();
         config.storage.dir = dir.clone();
         let store = Store::open(&dir).unwrap();
-        let tagger = Tagger::load().unwrap();
+        let tagger = Tagger::load(Model::Yamnet).unwrap();
         let quiet = vec![0.0; 40_000];
         let clip =
             Clip { samples: quiet, onset: 0, sound_end: 40_000, ts: 1_000_000, peak_db: -50.0, ambient_db: -60.0 };
@@ -535,7 +593,7 @@ mod tests {
         let mut config = Config::default();
         config.storage.dir = dir.clone();
         let mut store = Store::open(&dir).unwrap();
-        let tagger = Tagger::load().unwrap();
+        let tagger = Tagger::load(Model::Yamnet).unwrap();
         let sound: Vec<f32> =
             (0..40_000).map(|i| (2.0 * std::f32::consts::PI * 1_000.0 * i as f32 / 16_000.0).sin() * 0.5).collect();
         let tags = tagger.tag(&sound).unwrap();
@@ -565,6 +623,7 @@ mod tests {
                 nearest_event: None,
                 mix: &[],
                 check: false,
+                model: "yamnet",
             })
             .unwrap();
         store.label_event(music, "music").unwrap();
@@ -582,6 +641,42 @@ mod tests {
     }
 
     /// Steady noise, which the model hears as running water, then a square-wave alarm over it.
+    #[test]
+    fn switching_models_carries_taught_examples_over() {
+        let dir = std::env::temp_dir().join(format!("creak-switch-{}", std::process::id()));
+        let mut config = Config::default();
+        config.storage.dir = dir.clone();
+        let mut store = Store::open(&dir).unwrap();
+        let sound: Vec<f32> = hound::WavReader::open(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synth.wav"))
+            .unwrap()
+            .samples::<i16>()
+            .map(|s| s.unwrap() as f32 / 32768.0)
+            .collect();
+        let clip = |ts: i64| Clip {
+            samples: sound.clone(),
+            onset: 0,
+            sound_end: sound.len(),
+            ts,
+            peak_db: -20.0,
+            ambient_db: -60.0,
+        };
+        let newest = |store: &Store| store.events(&crate::store::Filter { limit: 1, ..Default::default() }).unwrap();
+
+        handle_clip(&config, &store, &Tagger::load(Model::Yamnet).unwrap(), &clip(1_000_000), &mut None).unwrap();
+        store.label_event(newest(&store)[0].id, "synth").unwrap();
+
+        let ced = Tagger::load(Model::CedTiny).unwrap();
+        assert_eq!(reanalyse(&mut store, &ced, &config).unwrap(), 1);
+        assert_eq!(reanalyse(&mut store, &ced, &config).unwrap(), 0, "nothing left to analyse");
+        let exemplars = store.exemplars("ced-tiny").unwrap();
+        assert_eq!(exemplars.iter().map(|x| x.embedding.len()).collect::<Vec<_>>(), [192]);
+
+        handle_clip(&config, &store, &ced, &clip(2_000_000), &mut None).unwrap();
+        let e = &newest(&store)[0];
+        assert_eq!((e.status.as_str(), e.label.as_str()), ("match", "synth"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Its whole clip is close to a water clip and the model's best sound is still water, so
     /// without the pre-roll it would be matched as water; the alarm is what came in.
     #[test]
@@ -590,7 +685,7 @@ mod tests {
         let mut config = Config::default();
         config.storage.dir = dir.clone();
         let mut store = Store::open(&dir).unwrap();
-        let tagger = Tagger::load().unwrap();
+        let tagger = Tagger::load(Model::Yamnet).unwrap();
         let mut seed = 7u32;
         let water: Vec<f32> = (0..PRE_ROLL + 48_000)
             .map(|_| {
@@ -619,7 +714,7 @@ mod tests {
         assert!(analysis.mix.iter().any(|p| p.class == "Waterfall" && p.background));
         let without_preroll = Clip { onset: 0, ..clip(with_alarm[PRE_ROLL..].to_vec(), 0) };
         let blind = analyse(&tagger, &without_preroll, config.classify.sound_score).unwrap();
-        let exemplars = store.exemplars().unwrap();
+        let exemplars = store.exemplars("yamnet").unwrap();
         let d = classify::decide(&blind.tags.embedding, &exemplars, &blind.sounds, &blind.mix, &config.classify);
         assert_eq!((d.status, d.label.as_str()), (classify::Status::Match, "water"), "{d:?}");
 
@@ -678,7 +773,7 @@ mod tests {
         assert!(clips[0].sound_end < clips[0].samples.len(), "the padding after the sound is not part of it");
 
         let mut store = Store::open(&dir).unwrap();
-        let tagger = Tagger::load().unwrap();
+        let tagger = Tagger::load(Model::Yamnet).unwrap();
         handle_clip(&config, &store, &tagger, &clips[0], &mut None).unwrap();
         let first = &store.events(&crate::store::Filter { limit: 1, ..Default::default() }).unwrap()[0];
         assert_eq!(first.status, "pending");

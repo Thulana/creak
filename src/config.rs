@@ -1,3 +1,4 @@
+use crate::embed::Model;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -43,6 +44,9 @@ pub struct Trigger {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Classify {
+    /// The model that tags clips. Changing it needs a restart; the daemon then analyses the clips
+    /// it still has again, so taught examples carry over. The thresholds were set for YAMNet.
+    pub model: Model,
     pub match_threshold: f32,
     pub suggest_threshold: f32,
     /// The weakest model score that still counts as hearing a sound.
@@ -97,7 +101,14 @@ impl Default for Trigger {
 
 impl Default for Classify {
     fn default() -> Self {
-        Self { match_threshold: 0.85, suggest_threshold: 0.60, sound_score: 0.1, conflict_score: 0.3, group_gap_s: 10 }
+        Self {
+            model: Model::Yamnet,
+            match_threshold: 0.85,
+            suggest_threshold: 0.60,
+            sound_score: 0.1,
+            conflict_score: 0.3,
+            group_gap_s: 10,
+        }
     }
 }
 
@@ -363,6 +374,14 @@ mod tests {
         assert_eq!(c.trigger.ratio, 4.0);
         assert_eq!(c.trigger.hang_ms, 800);
         assert_eq!(c.web.listen, "127.0.0.1:8377");
+    }
+
+    #[test]
+    fn model_is_chosen_by_name() {
+        assert_eq!(Config::default().classify.model, Model::Yamnet);
+        let c: Config = toml::from_str("[classify]\nmodel = \"ced-tiny\"\n").unwrap();
+        assert_eq!(c.classify.model, Model::CedTiny);
+        assert!(toml::from_str::<Config>("[classify]\nmodel = \"ced\"\n").is_err());
     }
 
     #[test]

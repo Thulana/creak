@@ -6,10 +6,9 @@
 use crate::classify::{self, Exemplar, MixPart, Status};
 use crate::config::{Classify, Config};
 use crate::daemon::{self, Clip};
-use crate::embed::{self, Tagger};
-use crate::store::{MatchStats, Store};
-use crate::trigger::SAMPLE_RATE;
-use anyhow::{Context, Result};
+use crate::embed::{self, Model, Tagger};
+use crate::store::{MatchStats, Store, StoredClip};
+use anyhow::Result;
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
@@ -198,11 +197,14 @@ pub struct Input {
     pub matches: Vec<MatchStats>,
 }
 
-/// Replays the audited clips and prints the report, with the settings in effect in the daemon.
-pub fn run(file: &Config) -> Result<()> {
+/// Replays the audited clips and prints the report, with the settings in effect in the daemon and
+/// `model`, or the configured model when it is None.
+pub fn run(file: &Config, model: Option<Model>) -> Result<()> {
     let store = Store::open(&file.storage.dir)?;
     let config = file.with_overrides(&store.overrides()?).unwrap_or_else(|_| file.clone());
-    let input = load(&store, &Tagger::load()?, &config)?;
+    let model = model.unwrap_or(config.classify.model);
+    let input = load(&store, &Tagger::load(model)?, &config)?;
+    println!("Model: {}", model.name());
     print!("{}", report(&input, &config.classify));
     Ok(())
 }
@@ -212,19 +214,21 @@ pub fn load(store: &Store, tagger: &Tagger, config: &Config) -> Result<Input> {
     let audited = store.audited()?;
     let mut input = Input::default();
     for a in &audited {
-        let path = store.dir().join(&a.clip_path);
-        let wave = match read_wav(&path) {
-            Ok(wave) => wave,
+        let stored = StoredClip {
+            event_id: a.event_id,
+            ts: a.ts,
+            clip_path: a.clip_path.clone(),
+            onset_ms: a.onset_ms,
+            sound_end_ms: a.sound_end_ms,
+        };
+        let clip = match daemon::read_clip(store.dir(), &stored, config.trigger.pre_roll_ms) {
+            Ok(clip) => clip,
             Err(e) => {
                 eprintln!("skipping event {}: {e:#}", a.event_id);
                 continue;
             }
         };
-        let at = |ms: i64| (ms.max(0) as usize * SAMPLE_RATE as usize / 1000).min(wave.len());
         input.assumed_onset += a.onset_ms.is_none() as usize;
-        let onset = at(a.onset_ms.unwrap_or(config.trigger.pre_roll_ms as i64));
-        let sound_end = a.sound_end_ms.map_or(wave.len(), at).max(onset);
-        let clip = Clip { samples: wave, onset, sound_end, ts: a.ts, peak_db: 0.0, ambient_db: 0.0 };
         input.samples.push(sample(tagger, &clip, a.event_id, &a.label, config.classify.sound_score)?);
     }
     input.unclear = store.audit_counts()?.iter().filter(|(label, _)| label.is_none()).map(|(_, n)| *n as usize).sum();
@@ -258,11 +262,6 @@ fn sample(tagger: &Tagger, clip: &Clip, event_id: i64, truth: &str, sound_score:
         mix: a.mix,
         heard_embedding,
     })
-}
-
-fn read_wav(path: &std::path::Path) -> Result<Vec<f32>> {
-    let reader = hound::WavReader::open(path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(reader.into_samples::<i16>().map(|s| s.map(|s| s as f32 / 32768.0)).collect::<Result<_, _>>()?)
 }
 
 fn percent(part: usize, whole: usize) -> String {
@@ -529,6 +528,7 @@ mod tests {
                 nearest_event: None,
                 mix: &[],
                 check: false,
+                model: "yamnet",
             };
             let id = store.insert_event(&event).unwrap();
             store.audit(id, (i < 4).then_some(label)).unwrap();
@@ -536,7 +536,7 @@ mod tests {
         }
         store.label_event(ids[1], "siren").unwrap();
 
-        let input = load(&store, &Tagger::load().unwrap(), &config).unwrap();
+        let input = load(&store, &Tagger::load(Model::Yamnet).unwrap(), &config).unwrap();
         assert_eq!((input.samples.len(), input.assumed_onset, input.unclear), (4, 4, 1));
         assert_eq!(input.disagreements, vec![(ids[1], "siren".to_string(), "alarm".to_string())]);
         assert_eq!(
